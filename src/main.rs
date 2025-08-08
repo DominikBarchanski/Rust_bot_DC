@@ -1,37 +1,32 @@
 mod db;
 mod commands;
+mod handlers;
 mod ui;
-// mod raid_handler;
+mod utils;
+mod tasks;
+
+use crate::handlers::Handler;
 use dotenvy::dotenv;
-use serenity::{Client, all::GatewayIntents};
+use serenity::all::{Client, GatewayIntents};
 use std::env;
-use tracing_subscriber;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load environment vars from .env
     dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    // Read configuration from environment
     let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not set");
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL not set");
 
-    // Initialize Postgres pool
     let pool = db::init_pool(&db_url).await?;
 
-    // Define the intents your bot needs
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT;
+    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
+    let handler = Handler::new(pool);
 
-    // Create Discord client
-    let handler = ui::Handler::new(pool.clone());
     let mut client = Client::builder(&token, intents)
         .event_handler(handler)
         .await?;
 
-    // Start the bot
     client.start().await?;
     Ok(())
 }

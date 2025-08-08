@@ -1,340 +1,291 @@
-use serenity::all::{
-    Command, CreateCommand, Context, CommandInteraction, CreateCommandOption, CommandOptionType,
-    ChannelType, CreateInteractionResponse, CreateInteractionResponseMessage,
-    CommandDataOptionValue, CreateMessage, ReactionType,
-};
-use chrono::{Utc, Weekday, Datelike, Duration};
-use sqlx::PgPool;
+use serenity::all::*;
+use serenity::builder::{CreateChannel, CreateMessage};
+use uuid::Uuid;
 
-/// Register `/raid` command with weekday and raid name options
-pub async fn register(ctx: &Context) -> serenity::Result<()> {
-    println!("🔧 Registering raid command...");
-    let result = Command::create_global_command(
+use crate::db::repo;
+use crate::handlers::pool_from_ctx;
+use crate::ui::{embeds, menus};
+use crate::utils::{parse_raid_datetime, weekday_key};
+use crate::tasks;
+
+pub async fn register(ctx: &Context) -> anyhow::Result<()> {
+    Command::create_global_command(
         &ctx.http,
         CreateCommand::new("raid")
-            .description("Create a raid channel under a weekday category")
+            .description("Create a raid")
+            // Required first
             .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "weekday",
-                    "Select the weekday category"
-                )
+                CreateCommandOption::new(CommandOptionType::String, "raid_name", "One of: arma_v2, pollu, arma")
                     .required(true)
-                    .add_string_choice("Monday", "monday")
-                    .add_string_choice("Tuesday", "tuesday")
-                    .add_string_choice("Wednesday", "wednesday")
-                    .add_string_choice("Thursday", "thursday")
-                    .add_string_choice("Friday", "friday")
-                    .add_string_choice("Saturday", "saturday")
-                    .add_string_choice("Sunday", "sunday")
+                    .add_string_choice("arma_v2", "arma_v2")
+                    .add_string_choice("pollu", "pollu")
+                    .add_string_choice("arma", "arma")
             )
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "raid_name",
-                    "Name of the raid"
-                )
-                    .required(true)
-            )
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "max_players",
-                    "Max Main+Alt"
-                )
-                    .required(true)
-            )
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "allows_alt",
-                    "Alt allowed?"
-                ).required(true)
-            )
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "priority_list",
-                    "Select priority Role"
-                )
-                    .required(false)
-            )
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::Integer,
-                    "priority_hour",
-                    "select priority hour 1-24"
-                )
-                    .min_int_value(1)
-                    .max_int_value(24)
-            )
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "required_sp",
-                    "Select priority Role"
-                )
-            )
-    ).await;
-
-    match &result {
-        Ok(_) => println!("✅ Raid command registered successfully"),
-        Err(e) => eprintln!("❌ Failed to register raid command: {}", e),
-    }
-
-    result.map(|_| ())
+            .add_option(CreateCommandOption::new(CommandOptionType::String, "raid_date", "Format: HH:MM YYYY-MM-DD").required(true))
+            .add_option(CreateCommandOption::new(CommandOptionType::Integer, "max_players", "Main slots").required(true))
+            .add_option(CreateCommandOption::new(CommandOptionType::Boolean, "allow_alts", "Allow alts").required(true))
+            .add_option(CreateCommandOption::new(CommandOptionType::Integer, "max_alts", "Alt slots").required(true))
+            .add_option(CreateCommandOption::new(CommandOptionType::Boolean, "priority", "Enable priority role window").required(true))
+            .add_option(CreateCommandOption::new(CommandOptionType::String, "description", "Short description").required(true))
+            // Optional after
+            .add_option(CreateCommandOption::new(CommandOptionType::String, "prioritylist", "Role name for priority (e.g., Maraton)"))
+            .add_option(CreateCommandOption::new(CommandOptionType::Integer, "priority_hours", "How long priority lasts (hours)"))
+    ).await?;
+    Ok(())
 }
 
-/// Handle the `/raid` command - create channel, setup raid, and save to database
-pub async fn handle_with_db(
-    ctx: &Context,
-    cmd: &CommandInteraction,
-    pool: &PgPool,
-) -> serenity::Result<()> {
-    println!("🎮 Raid command received from user: {}", cmd.user.name);
+pub async fn register_kick(ctx: &Context) -> anyhow::Result<()> {
+    Command::create_global_command(
+        &ctx.http,
+        CreateCommand::new("raid_kick")
+            .description("Kick a participant from a raid (owner only)")
+            .add_option(CreateCommandOption::new(CommandOptionType::String, "raid_id", "Raid UUID").required(true))
+            .add_option(CreateCommandOption::new(CommandOptionType::User, "user", "User to kick").required(true))
+    ).await?;
+    Ok(())
+}
 
-    let guild_id = match cmd.guild_id {
-        Some(g) => {
-            println!("📍 Guild ID: {}", g.get());
-            g
-        },
-        None => {
-            println!("❌ Command used outside of guild");
-            let response = CreateInteractionResponseMessage::new()
-                .content("This command must be used in a server.")
-                .ephemeral(true);
-            cmd.create_response(&ctx.http, CreateInteractionResponse::Message(response)).await?;
-            return Ok(());
+pub async fn register_transfer(ctx: &Context) -> anyhow::Result<()> {
+    Command::create_global_command(
+        &ctx.http,
+        CreateCommand::new("raid_transfer")
+            .description("Transfer raid ownership")
+            .add_option(CreateCommandOption::new(CommandOptionType::String, "raid_id", "Raid UUID").required(true))
+            .add_option(CreateCommandOption::new(CommandOptionType::User, "new_owner", "User").required(true))
+    ).await?;
+    Ok(())
+}
+
+pub async fn handle(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    match cmd.data.name.as_str() {
+        "raid" => handle_create(ctx, cmd).await,
+        "raid_kick" => handle_kick(ctx, cmd).await,
+        "raid_transfer" => handle_transfer(ctx, cmd).await,
+        _ => Ok(())
+    }
+}
+
+async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    let mut raid_name = "arma_v2".to_string();
+    let mut raid_date_str = String::new();
+    let mut max_players: i64 = 12;
+    let mut allow_alts = true;
+    let mut max_alts: i64 = 1;
+    let mut priority = false;
+    let mut priority_role_name: Option<String> = None;
+    let mut priority_hours: Option<i64> = None;
+    let mut description = String::new();
+
+    for opt in &cmd.data.options {
+        match opt.name.as_str() {
+            "raid_name" => if let CommandDataOptionValue::String(s) = &opt.value { raid_name = s.clone(); },
+            "raid_date" => if let CommandDataOptionValue::String(s) = &opt.value { raid_date_str = s.clone(); },
+            "max_players" => if let CommandDataOptionValue::Integer(n) = &opt.value { max_players = *n; },
+            "allow_alts" => if let CommandDataOptionValue::Boolean(b) = &opt.value { allow_alts = *b; },
+            "max_alts" => if let CommandDataOptionValue::Integer(n) = &opt.value { max_alts = *n; },
+            "priority" => if let CommandDataOptionValue::Boolean(b) = &opt.value { priority = *b; },
+            "priority_hours" => if let CommandDataOptionValue::Integer(n) = &opt.value { priority_hours = Some(*n); },
+            "prioritylist" => if let CommandDataOptionValue::String(s) = &opt.value { priority_role_name = Some(s.clone()); },
+            "description" => if let CommandDataOptionValue::String(s) = &opt.value { description = s.clone(); },
+            _ => {}
         }
-    };
+    }
 
-    println!("📋 Extracting command options...");
-
-    // Extract command options
-    let selected_weekday = cmd.data.options.iter()
-        .find(|opt| opt.name == "weekday")
-        .and_then(|opt| match &opt.value {
-            CommandDataOptionValue::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "monday".to_string());
-
-    let raid_name = cmd.data.options.iter()
-        .find(|opt| opt.name == "raid_name")
-        .and_then(|opt| match &opt.value {
-            CommandDataOptionValue::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "Unknown Raid".to_string());
-
-    println!("📝 Options extracted - Weekday: {}, Raid: {}", selected_weekday, raid_name);
-
-    // Get all channels in the guild
-    println!("🔍 Fetching guild channels...");
-    let channels = match guild_id.channels(&ctx.http).await {
-        Ok(channels) => {
-            println!("✅ Found {} channels", channels.len());
-            channels
-        },
-        Err(e) => {
-            eprintln!("❌ Failed to fetch channels: {}", e);
-            return Err(e);
-        }
-    };
-
-    // Find the category channel matching the selected weekday
-    println!("🔍 Looking for category: {}", selected_weekday);
-    let category_channel = channels.values()
-        .find(|channel| {
-            let matches = channel.kind == ChannelType::Category &&
-                channel.name.to_lowercase().contains(&selected_weekday.to_lowercase());
-            if matches {
-                println!("✅ Found matching category: {}", channel.name);
-            }
-            matches
-        });
-
-    let category_id = match category_channel {
-        Some(category) => {
-            println!("✅ Using category ID: {}", category.id);
-            Some(category.id)
-        },
-        None => {
-            println!("❌ No category found for: {}", selected_weekday);
-            let response = CreateInteractionResponseMessage::new()
-                .content(format!("❌ No category channel found with name: `{}`", selected_weekday))
-                .ephemeral(true);
-            cmd.create_response(&ctx.http, CreateInteractionResponse::Message(response)).await?;
-            return Ok(());
-        }
-    };
-
-    // Calculate next date for the selected weekday
-    println!("📅 Calculating next weekday date...");
-    let weekday_enum = string_to_weekday(&selected_weekday).unwrap();
-    let next_date = get_next_weekday_date(weekday_enum);
-    println!("📅 Next date: {}", next_date);
-
-    // Create channel name: "raid-name-YYYY-MM-DD"
-    let channel_name = format!("{}-{}",
-                               raid_name.to_lowercase().replace(" ", "-"),
-                               next_date
-    );
-    println!("📺 Channel name will be: {}", channel_name);
-
-    // Check if channel already exists
-    let existing_channel = channels.values()
-        .find(|channel| {
-            channel.name == channel_name &&
-                channel.parent_id == category_id
-        });
-
-    if existing_channel.is_some() {
-        println!("❌ Channel already exists: {}", channel_name);
-        let response = CreateInteractionResponseMessage::new()
-            .content(format!("❌ Channel `{}` already exists under `{}`!", channel_name, selected_weekday))
-            .ephemeral(true);
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(response)).await?;
+    let Some(scheduled_for) = parse_raid_datetime(&raid_date_str) else {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Invalid date format. Use `HH:MM YYYY-MM-DD`.").ephemeral(true)
+        )).await?;
         return Ok(());
+    };
+
+    let mut priority_role_id: Option<i64> = None;
+    let mut priority_until: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    if priority {
+        let role_name = priority_role_name.clone().unwrap_or_else(|| "Maraton".to_string());
+        if let Some(gid) = cmd.guild_id {
+            let roles_map = gid.roles(&ctx.http).await?;
+            let role_id = roles_map
+                .iter()
+                .find_map(|(rid, r)| if r.name.eq_ignore_ascii_case(&role_name) { Some(*rid) } else { None });
+            let Some(role_id) = role_id else {
+                cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new().content(format!("Role `{}` not found.", role_name)).ephemeral(true)
+                )).await?;
+                return Ok(());
+            };
+            let member = gid.member(&ctx.http, cmd.user.id).await?;
+            if !member.roles.contains(&role_id) {
+                cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new().content(format!("You don't have the `{}` role required for priority.", role_name)).ephemeral(true)
+                )).await?;
+                return Ok(());
+            }
+            priority_role_id = Some(role_id.get() as i64);
+            if let Some(h) = priority_hours {
+                priority_until = Some(scheduled_for - chrono::Duration::hours(h));
+            }
+        }
     }
 
-    // Create the new channel under the category
-    println!("🏗️ Creating new channel...");
-    let builder = serenity::builder::CreateChannel::new(&channel_name)
-        .kind(ChannelType::Text)
-        .category(category_id.unwrap())
-        .topic(format!("Raid: {} scheduled for {}", raid_name, next_date));
-
-    let new_channel = match guild_id.create_channel(&ctx.http, builder).await {
-        Ok(channel) => {
-            println!("✅ Channel created: {} (ID: {})", channel.name, channel.id);
-            channel
-        },
-        Err(e) => {
-            eprintln!("❌ Failed to create channel: {}", e);
-            return Err(e);
+    let gid = match cmd.guild_id {
+        Some(g) => g,
+        None => {
+            cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content("Use this in a server.").ephemeral(true)
+            )).await?;
+            return Ok(());
         }
     };
 
-    // Send initial message to the new channel
-    println!("💬 Sending initial message to channel...");
-    let message = CreateMessage::new()
-        .content(format!(
-            "🎮 **{}** raid scheduled for **{}**!\n\n\
-            📅 Date: {}\n\
-            👤 Created by: <@{}>\n\n\
-            React with ✅ to join this raid!",
-            raid_name, selected_weekday, next_date, cmd.user.id
-        ))
-        .reactions(vec![ReactionType::Unicode("✅".to_string())]);
+    let weekday = weekday_key(scheduled_for);
+    let guild = gid.to_partial_guild(&ctx.http).await?;
+    let channels = guild.channels(&ctx.http).await?;
+    let category_id = channels.values().find_map(|c| {
+        if c.kind == ChannelType::Category && c.name.to_lowercase().contains(weekday) { Some(c.id) } else { None }
+    });
 
-    let raid_message = match new_channel.send_message(&ctx.http, message).await {
-        Ok(msg) => {
-            println!("✅ Message sent with ID: {}", msg.id);
-            msg
-        },
-        Err(e) => {
-            eprintln!("❌ Failed to send message: {}", e);
-            return Err(e);
+    let chan_name = format!("{}-{}-{}", raid_name.replace('_', "-"),
+                            scheduled_for.format("%Y%m%d"),
+                            scheduled_for.format("%H%M"));
+
+    let text_channel = match category_id {
+        Some(cat) => {
+            gid.create_channel(&ctx.http, CreateChannel::new(&chan_name).kind(ChannelType::Text).category(cat)).await?
+        }
+        None => {
+            gid.create_channel(&ctx.http, CreateChannel::new(&chan_name).kind(ChannelType::Text)).await?
         }
     };
 
-    println!("🔍 Attempting to save raid to database:");
-    println!("  Guild ID: {}", guild_id.get() as i64);
-    println!("  Channel ID: {}", new_channel.id.get() as i64);
-    println!("  Message ID: {}", raid_message.id.get() as i64);
-    println!("  Created by: {}", cmd.user.id.get() as i64);
-    println!("  Description: {}", raid_name);
+    let raid_id = Uuid::new_v4();
+    let embed = embeds::render_new_raid_embed(&raid_name, &description, scheduled_for);
+    let msg = text_channel.id.send_message(
+        &ctx.http,
+        CreateMessage::new()
+            .embed(embed)
+            .components(vec![menus::main_buttons_row(raid_id)])
+    ).await?;
 
-    // Convert the date string to DateTime<Utc>
-    let scheduled_datetime = match chrono::NaiveDate::parse_from_str(&next_date, "%Y-%m-%d") {
-        Ok(date) => {
-            println!("✅ Date parsed successfully");
-            // Set default time to 20:00 (8 PM) UTC
-            date.and_hms_opt(20, 0, 0).unwrap().and_utc()
-        },
-        Err(e) => {
-            eprintln!("❌ Failed to parse date {}: {}", next_date, e);
-            // Fallback to tomorrow at 8 PM
-            (Utc::now() + Duration::days(1)).date_naive().and_hms_opt(20, 0, 0).unwrap().and_utc()
-        }
-    };
-
-    println!("  Scheduled for: {}", scheduled_datetime);
-
-    // Save raid to database
-    println!("💾 Calling database create_raid function...");
-    match crate::db::repo::create_raid(
-        pool,
-        guild_id.get() as i64,
-        new_channel.id.get() as i64,
-        scheduled_datetime,
+    repo::create_raid_with_id(
+        &pool_from_ctx(ctx).await?,
+        raid_id,
+        gid.get() as i64,
+        text_channel.id.get() as i64,
+        msg.id.get() as i64,
+        scheduled_for,
         cmd.user.id.get() as i64,
-        raid_name.clone(),
         cmd.user.id.get() as i64,
-        raid_message.id.get() as i64,
-        false, // is_priority
-        String::new(), // priority_list
-    ).await {
-        Ok(raid) => {
-            println!("✅ Raid saved to database with ID: {}", raid.id);
-        },
-        Err(e) => {
-            eprintln!("❌ Failed to save raid to database: {}", e);
-            eprintln!("   Error details: {:?}", e);
-        }
+        description,
+        vec![],
+        priority,
+        raid_name,
+        max_players as i32,
+        allow_alts,
+        max_alts as i32,
+        priority_role_id,
+        priority_until,
+    ).await?;
+
+    if let Some(until) = priority_until {
+        tasks::schedule_priority_promotion(
+            ctx.http.clone(),
+            pool_from_ctx(ctx).await?,
+            raid_id,
+            gid.get() as i64,
+            text_channel.id.get() as i64,
+            msg.id.get() as i64,
+            until,
+        );
     }
+    tasks::schedule_auto_delete(
+        ctx.http.clone(),
+        raid_id,
+        text_channel.id.get() as i64,
+        scheduled_for + chrono::Duration::minutes(20),
+    );
 
-    // Respond to the command
-    println!("📤 Sending response to user...");
-    let response = CreateInteractionResponseMessage::new()
-        .content(format!(
-            "✅ **Raid channel created!**\n\
-            📁 Category: `{}`\n\
-            📺 Channel: <#{}>\n\
-            🎮 Raid: `{}`\n\
-            📅 Date: `{}`",
-            selected_weekday, new_channel.id, raid_name, next_date
-        ));
-
-    match cmd.create_response(&ctx.http, CreateInteractionResponse::Message(response)).await {
-        Ok(_) => println!("✅ Response sent successfully"),
-        Err(e) => eprintln!("❌ Failed to send response: {}", e),
-    }
-
-    println!("🎯 Raid command completed");
+    cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content("Raid created!").ephemeral(true)
+    )).await?;
     Ok(())
 }
 
-// Keep your existing helper functions
-pub async fn handle(ctx: &Context, cmd: &CommandInteraction) -> serenity::Result<()> {
-    println!("⚠️ Warning: Raid command called without database integration");
+async fn handle_kick(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    let mut raid_id_s = String::new();
+    let mut user_id: Option<UserId> = None;
+    for o in &cmd.data.options {
+        match o.name.as_str() {
+            "raid_id" => if let CommandDataOptionValue::String(s) = &o.value { raid_id_s = s.clone(); },
+            "user" => if let CommandDataOptionValue::User(u) = &o.value { user_id = Some(*u); },
+            _ => {}
+        }
+    }
+
+    let Ok(raid_uuid) = Uuid::parse_str(&raid_id_s) else {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Invalid raid_id").ephemeral(true)
+        )).await?; return Ok(());
+    };
+
+    let pool = pool_from_ctx(ctx).await?;
+    let raid = repo::get_raid(&pool, raid_uuid).await?;
+    if raid.owner_id != cmd.user.id.get() as i64 {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Only the raid owner can kick.").ephemeral(true)
+        )).await?; return Ok(());
+    }
+
+    let Some(u) = user_id else {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Missing user.").ephemeral(true)
+        )).await?; return Ok(());
+    };
+
+    let _ = repo::remove_participant(&pool, raid_uuid, u.get() as i64).await?;
+
+    let parts = repo::list_participants(&pool, raid_uuid).await?;
+    let embed = crate::ui::embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
+    ChannelId::new(raid.channel_id as u64)
+        .edit_message(&ctx.http, raid.message_id as u64,
+                      serenity::builder::EditMessage::new()
+                          .embed(embed)
+                          .components(vec![crate::ui::menus::main_buttons_row(raid_uuid)]))
+        .await?;
+
+    cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content("Kicked.").ephemeral(true)
+    )).await?;
     Ok(())
 }
 
-fn get_next_weekday_date(target_weekday: Weekday) -> String {
-    let today = Utc::now().date_naive();
-    let today_weekday = today.weekday();
-
-    let days_until_target = if target_weekday.number_from_monday() >= today_weekday.number_from_monday() {
-        target_weekday.number_from_monday() - today_weekday.number_from_monday()
-    } else {
-        7 - today_weekday.number_from_monday() + target_weekday.number_from_monday()
-    };
-
-    let target_date = today + Duration::days(days_until_target as i64);
-    target_date.format("%Y-%m-%d").to_string()
-}
-
-fn string_to_weekday(day: &str) -> Option<Weekday> {
-    match day.to_lowercase().as_str() {
-        "monday" => Some(Weekday::Mon),
-        "tuesday" => Some(Weekday::Tue),
-        "wednesday" => Some(Weekday::Wed),
-        "thursday" => Some(Weekday::Thu),
-        "friday" => Some(Weekday::Fri),
-        "saturday" => Some(Weekday::Sat),
-        "sunday" => Some(Weekday::Sun),
-        _ => None,
+async fn handle_transfer(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    let mut raid_s = String::new();
+    let mut new_owner: Option<UserId> = None;
+    for o in &cmd.data.options {
+        match o.name.as_str() {
+            "raid_id" => if let CommandDataOptionValue::String(s) = &o.value { raid_s = s.clone(); },
+            "new_owner" => if let CommandDataOptionValue::User(u) = &o.value { new_owner = Some(*u); },
+            _ => {}
+        }
     }
+    let Ok(raid_id) = Uuid::parse_str(&raid_s) else {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Invalid raid_id").ephemeral(true)
+        )).await?; return Ok(());
+    };
+    let pool = pool_from_ctx(ctx).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    if raid.owner_id != cmd.user.id.get() as i64 {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Only current owner can transfer.").ephemeral(true)
+        )).await?; return Ok(());
+    }
+    let Some(new_owner) = new_owner else { return Ok(()); };
+    sqlx::query!("UPDATE raids SET owner_id = $1 WHERE id = $2", new_owner.get() as i64, raid_id)
+        .execute(&pool).await?;
+    cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content("Ownership transferred.").ephemeral(true)
+    )).await?;
+    Ok(())
 }

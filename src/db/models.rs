@@ -1,9 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serenity::all::UserId;
+use sqlx::types::Json;
 use uuid::Uuid;
 
-/// Represents a scheduled raid.
 #[derive(sqlx::FromRow, Serialize, Deserialize, Debug, Clone)]
 pub struct Raid {
     pub id: Uuid,
@@ -16,16 +15,24 @@ pub struct Raid {
     pub description: String,
     pub is_priority: bool,
     pub is_active: bool,
-    pub priority_list:String
+    pub priority_list: Json<Vec<i64>>,
+
+    pub raid_name: String,
+    pub max_players: i32,
+    pub allow_alts: bool,
+    pub max_alts: i32,
+    pub priority_role_id: Option<i64>,
+    pub priority_until: Option<DateTime<Utc>>,
 }
 
 #[derive(sqlx::FromRow, Serialize, Deserialize, Debug, Clone)]
 pub struct RaidParticipant {
     pub id: Uuid,
-    pub raid_id: i64,
-    pub user_id: UserId,
+    pub raid_id: Uuid,
+    pub user_id: i64,
     pub is_main: bool,
     pub joined_as: String,
-    pub is_reserve: bool
-
+    pub is_reserve: bool,
+    pub joined_at: DateTime<Utc>,
+    pub is_alt: bool,
 }
