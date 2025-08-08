@@ -5,6 +5,11 @@ use crate::utils::{from_user_id, parse_component_id};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serenity::all::*;
+use serenity::builder::{
+    CreateInteractionResponse,
+    CreateInteractionResponseMessage,
+    EditInteractionResponse,
+};
 use serenity::builder::{EditMessage, CreateMessage};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
@@ -34,6 +39,7 @@ pub async fn handle_component(ctx: &Context, it: &ComponentInteraction) -> anyho
         ("pr", "") => owner_promote(ctx, it, raid_id).await?,
         ("kk", "") => owner_kick(ctx, it, raid_id).await?,
         ("cx", "") => owner_cancel(ctx, it, raid_id).await?,
+        ("cl", "") => close_ephemeral(ctx,it).await?,
         _ => {}
     }
 
@@ -130,7 +136,46 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
 
     let pool = pool_from_ctx(ctx).await?;
     let raid = repo::get_raid(&pool, raid_id).await?;
+    if !raid.is_active {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("This raid has been canceled.")
+                .ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+    // === WYMÓG ról c1-89 lub c90 ===
+    let mut allowed_by_crole = false;
+    let mut has_c1_89 = false;
 
+    if let Some(gid) = it.guild_id {
+        let roles_map = gid.roles(&ctx.http).await?;
+        if let Ok(member) = gid.member(&ctx.http, it.user.id).await {
+            for rid in &member.roles {
+                if let Some(r) = roles_map.get(rid) {
+                    let name = r.name.to_ascii_lowercase();
+                    if name == "c1-89" || name == "c90" {
+                        if name=="c1-89" { has_c1_89 = true; }
+                        allowed_by_crole = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if !allowed_by_crole {
+        it.create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("You need role **c1-89** or **c90**, to join this raid.")
+                    .ephemeral(true),
+            ),
+        ).await?;
+        return Ok(());
+    }
+    let tag_suffix = if has_c1_89 { " [-c90]".to_string() } else { String::new() };
     // reserve role always → reserve
     let reserve_role_name = env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
     let mut force_reserve = false;
@@ -187,11 +232,11 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         let alt_slots_left = (raid.max_alts - alt_mains).max(0);
 
         let can_be_main = free_main > 0 && alt_slots_left > 0 && !must_reserve;
-        let _ = repo::insert_alt(&pool, raid_id, from_user_id(it.user.id), joined_as, can_be_main).await?;
+        let _ = repo::insert_alt(&pool, raid_id, from_user_id(it.user.id), joined_as, can_be_main,tag_suffix.clone()).await?;
     } else {
         // main join: ensure only one main per user
         let can_be_main = free_main > 0 && !must_reserve;
-        let _ = repo::insert_or_replace_main(&pool, raid_id, from_user_id(it.user.id), joined_as, can_be_main).await?;
+        let _ = repo::insert_or_replace_main(&pool, raid_id, from_user_id(it.user.id), joined_as, can_be_main,tag_suffix.clone()).await?;
     }
 
     // If window ended, try to promote reserves within alt cap
@@ -224,12 +269,30 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
 
 async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
     let pool = pool_from_ctx(ctx).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    if !raid.is_active {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("This raid has been canceled.")
+                .ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
     let _ = repo::remove_participant(&pool, raid_id, from_user_id(it.user.id)).await?;
     refresh_message(ctx, it, raid_id, "You have been signed out.").await
 }
 
 async fn leave_alts(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
     let pool = pool_from_ctx(ctx).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    if !raid.is_active {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("This raid has been canceled. ")
+                .ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
     let _ = repo::remove_user_alts(&pool, raid_id, from_user_id(it.user.id)).await?;
     refresh_message(ctx, it, raid_id, "Removed your alts.").await
 }
@@ -258,13 +321,23 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         )).await?;
         return Ok(());
     }
+    if !raid.is_active {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("This raid has been canceled. Managing is no longer available.")
+                .ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+
 
     let parts = repo::list_participants(&pool, raid_id).await?;
     // reserves-only options for Promote
     let mut promote_opts: Vec<(String,String)> = parts.iter()
         .filter(|p| !p.is_main)
-        .map(|p| (format!("{} <@{}>{}", p.joined_as, p.user_id, if p.is_alt {" (ALT)"} else {""}), p.user_id.to_string()))
+        .map(|p| (format!("{} <@{}>{}", p.joined_as, p.user_id, if p.is_alt {" (ALT)"} else {""}), p.user_id.to_string()+if p.is_alt { " ALT" } else { "" }))
         .collect();
+
 
     if promote_opts.is_empty() {
         promote_opts.push(("No reserves".into(), "none".into()));
@@ -275,7 +348,7 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         .map(|p| (format!("{} <@{}>{}{}", p.joined_as, p.user_id,
                           if p.is_main {" [MAIN]"} else {" [RES]"},
                           if p.is_alt {" (ALT)"} else {""}),
-                  p.user_id.to_string()))
+                  p.user_id.to_string()+if p.is_alt {" (ALT)"} else {""}))
         .collect();
 
     if kick_opts.is_empty() {
@@ -293,6 +366,9 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
                     CreateButton::new(format!("r:cx:{raid_id}"))
                         .label("Cancel Raid (DM all + delete in 1h)")
                         .style(ButtonStyle::Danger),
+                    CreateButton::new(format!("r:cl:{raid_id}"))
+                        .label("Close")
+                        .style(ButtonStyle::Secondary),
                 ])
             ])
     )).await?;
@@ -400,13 +476,53 @@ async fn owner_cancel(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         let http = ctx.http.clone();
         let channel_id = raid.channel_id as u64;
         async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(7200)).await;
             let _ = ChannelId::new(channel_id).delete(&http).await;
         }
     });
 
     it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
-        CreateInteractionResponseMessage::new().content("Raid canceled. Channel will delete in ~1h.")
+        CreateInteractionResponseMessage::new().content("Raid canceled. Channel will delete in ~2h.")
     )).await?;
     Ok(())
 }
+async fn close_ephemeral(ctx: &Context, it: &ComponentInteraction) -> anyhow::Result<()> {
+    // 1) Acknowledge quickly via UpdateMessage to avoid "Ta czynność się nie powiodła"
+    //    Also remove components so it can't be clicked again.
+    let ack = CreateInteractionResponse::UpdateMessage(
+        CreateInteractionResponseMessage::new()
+            .content("Closing…")
+            .components(Vec::new()),
+    );
+
+    if let Err(err) = it.create_response(&ctx.http, ack).await {
+        tracing::warn!("close_ephemeral: initial UpdateMessage failed: {err:?}");
+        return Ok(());
+    }
+
+    // 2) Try to delete the original interaction response (works if this ephemeral is the original)
+    match it.delete_response(&ctx.http).await {
+        Ok(()) => return Ok(()),
+        Err(err) => {
+            tracing::debug!("close_ephemeral: delete_response failed: {err:?}; trying followup delete");
+
+            // 3) If it was a followup ephemeral, delete that specific followup by message id
+            if let Err(err2) = it.delete_followup(&ctx.http, it.message.id).await {
+                tracing::warn!("close_ephemeral: delete_followup_message failed: {err2:?}; falling back to edit");
+
+                // 4) Final fallback: keep a tiny stub with components removed
+                let _ = it
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content("Closed.")
+                            .components(Vec::new()),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    Ok(())
+}
+

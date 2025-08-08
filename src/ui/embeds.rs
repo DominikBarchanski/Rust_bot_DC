@@ -1,11 +1,14 @@
-use serenity::all::{Context, CreateEmbed};
+use serenity::all::{Context, CreateEmbed,GuildId,UserId};
 use crate::db::models::{Raid, RaidParticipant};
 use crate::utils::emoji_tag;
+use chrono::{DateTime, Utc};
+use chrono_tz::Europe::Warsaw;
 
-pub fn render_new_raid_embed(raid_name: &str, description: &str, scheduled_for: chrono::DateTime<chrono::Utc>) -> CreateEmbed {
+pub fn render_new_raid_embed(raid_name: &str, description: &str, scheduled_for: chrono::DateTime<chrono::Utc>, max_player:&i64) -> CreateEmbed {
+    let when_local = scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
     CreateEmbed::new()
         .title(format!("Raid: {}", raid_name))
-        .description(format!("**Date:** {}\n{}", scheduled_for, render_empty_slots(10)))
+        .description(format!("**Date:** {}\n{}", when_local, render_empty_slots(*max_player )))
         .field("Description", description, false)
 }
 
@@ -26,20 +29,22 @@ fn render_raid_embed_inner(ctx_guild: Option<(&Context, u64)>, raid: &Raid, part
     let mut reserves: Vec<&RaidParticipant> = participants.iter().filter(|p| !p.is_main).collect();
     reserves.sort_by_key(|p| (p.is_alt, p.joined_at)); // show non-alt reserves first
 
+
     let mut lines: Vec<String> = Vec::with_capacity(slots);
     for i in 0..slots {
         if let Some(p) = mains.get(i) {
             let label = decorate_joined_as(ctx_guild, &p.joined_as);
+            let suffix_role = p.tag_suffix.as_str();
             let suffix = if p.is_alt { " (ALT)" } else { "" };
-            lines.push(format!("{}. {} <@{}>{}", i + 1, label, p.user_id, suffix));
+            lines.push(format!("{}. {} <@{}>{}{}", i + 1, label, p.user_id, suffix,suffix_role));
         } else {
             lines.push(format!("{}. [Empty]", i + 1));
         }
     }
-
+    let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
     let mut e = CreateEmbed::new()
         .title(format!("Raid: {}", raid.raid_name))
-        .description(format!("**Date:** {}\n{}", raid.scheduled_for, lines.join("\n")))
+        .description(format!("**Date:** {}\n{}", when_local, lines.join("\n")))
         .field("Description", &raid.description, false)
         .field(
             "Capacity",
@@ -62,7 +67,8 @@ fn render_raid_embed_inner(ctx_guild: Option<(&Context, u64)>, raid: &Raid, part
         for p in reserves.iter().take(10) {
             let label = decorate_joined_as(ctx_guild, &p.joined_as);
             let suffix = if p.is_alt { " (ALT)" } else { "" };
-            rlines.push(format!("• {} <@{}>{}", label, p.user_id, suffix));
+            let suffix_role = p.tag_suffix.as_str();
+            rlines.push(format!("• {} <@{}>{}{}", label, p.user_id, suffix,suffix_role));
         }
         if reserves.len() > 10 {
             rlines.push(format!("... and {} more", reserves.len() - 10));
@@ -73,7 +79,7 @@ fn render_raid_embed_inner(ctx_guild: Option<(&Context, u64)>, raid: &Raid, part
     e
 }
 
-fn render_empty_slots(n: usize) -> String {
+fn render_empty_slots(n: i64) -> String {
     (1..=n).map(|i| format!("{i}. [Empty]")).collect::<Vec<_>>().join("\n")
 }
 

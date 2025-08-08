@@ -7,6 +7,8 @@ use crate::handlers::pool_from_ctx;
 use crate::ui::{embeds, menus};
 use crate::utils::{parse_raid_datetime, weekday_key};
 use crate::tasks;
+use chrono::{DateTime, Utc};
+use chrono_tz::Europe::Warsaw;
 
 pub async fn register(ctx: &Context) -> anyhow::Result<()> {
     Command::create_global_command(
@@ -14,12 +16,21 @@ pub async fn register(ctx: &Context) -> anyhow::Result<()> {
         CreateCommand::new("raid")
             .description("Create a raid")
             // Required first
+            //raid_name IN ('ArmaV2','Pollutus','Arma','Azgobas','Valehir','Alzanor','Hc_Azgobas','Hc_Valehir','Hc_Alzanor','Hc_A8-A6','Hc_A1-A5')
             .add_option(
                 CreateCommandOption::new(CommandOptionType::String, "raid_name", "One of: arma_v2, pollu, arma")
                     .required(true)
-                    .add_string_choice("arma_v2", "arma_v2")
-                    .add_string_choice("pollu", "pollu")
-                    .add_string_choice("arma", "arma")
+                    .add_string_choice("ArmaV2", "ArmaV2")
+                    .add_string_choice("Pollutus", "Pollutus")
+                    .add_string_choice("Arma", "Arma")
+                    .add_string_choice("Azgobas", "Azgobas")
+                    .add_string_choice("Valehir", "Valehir")
+                    .add_string_choice("Alzanor", "Alzanor")
+                    .add_string_choice("Hc_Azgobas", "Hc_Azgobas")
+                    .add_string_choice("Hc_Valehir", "Hc_Valehir")
+                    .add_string_choice("Hc_Alzanor", "Hc_Alzanor")
+                    .add_string_choice("Hc_A8-A6", "Hc_A8-A6")
+                    .add_string_choice("Hc_A1-A5", "Hc_A1-A5")
             )
             .add_option(CreateCommandOption::new(CommandOptionType::String, "raid_date", "Format: HH:MM YYYY-MM-DD").required(true))
             .add_option(CreateCommandOption::new(CommandOptionType::Integer, "max_players", "Main slots").required(true))
@@ -144,10 +155,10 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
     let category_id = channels.values().find_map(|c| {
         if c.kind == ChannelType::Category && c.name.to_lowercase().contains(weekday) { Some(c.id) } else { None }
     });
-
+    let when_local = scheduled_for.with_timezone(&Warsaw);
     let chan_name = format!("{}-{}-{}", raid_name.replace('_', "-"),
-                            scheduled_for.format("%Y%m%d"),
-                            scheduled_for.format("%H%M"));
+                            when_local.format("%m_%d"),
+                            when_local.format("%H_%M"));
 
     let text_channel = match category_id {
         Some(cat) => {
@@ -159,7 +170,7 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
     };
 
     let raid_id = Uuid::new_v4();
-    let embed = embeds::render_new_raid_embed(&raid_name, &description, scheduled_for);
+    let embed = embeds::render_new_raid_embed(&raid_name, &description, scheduled_for, &max_players);
     let msg = text_channel.id.send_message(
         &ctx.http,
         CreateMessage::new()

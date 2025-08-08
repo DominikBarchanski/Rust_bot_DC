@@ -71,7 +71,7 @@ pub async fn list_participants(pool: &PgPool, raid_id: Uuid) -> anyhow::Result<V
     let rows = sqlx::query_as!(
         RaidParticipant,
         r#"
-        SELECT id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt
+        SELECT id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt, tag_suffix
         FROM raid_participants
         WHERE raid_id = $1
         ORDER BY is_main DESC, is_alt ASC, joined_at ASC
@@ -129,17 +129,18 @@ pub async fn insert_or_replace_main(
     user_id: i64,
     joined_as: String,
     main_now: bool, // if false, goes to reserve (non-alt)
+    tag_suffix: String,
 ) -> anyhow::Result<RaidParticipant> {
     // if user already has a main row, update it; otherwise insert
     let maybe = sqlx::query_as!(
         RaidParticipant,
         r#"
         UPDATE raid_participants
-        SET joined_as = $1, is_main = $2, is_reserve = NOT $2, is_alt = FALSE
+        SET joined_as = $1, is_main = $2, is_reserve = NOT $2, is_alt = FALSE, tag_suffix = $5
         WHERE raid_id = $3 AND user_id = $4 AND is_alt = FALSE
-        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt
+        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt, tag_suffix
         "#,
-        joined_as, main_now, raid_id, user_id
+        joined_as, main_now, raid_id, user_id,tag_suffix
     ).fetch_optional(pool).await?;
 
     if let Some(row) = maybe {
@@ -150,11 +151,11 @@ pub async fn insert_or_replace_main(
     let row = sqlx::query_as!(
         RaidParticipant,
         r#"
-        INSERT INTO raid_participants (id, raid_id, user_id, is_main, joined_as, is_reserve, is_alt)
-        VALUES ($1,$2,$3,$4,$5,$6,FALSE)
-        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt
+        INSERT INTO raid_participants (id, raid_id, user_id, is_main, joined_as, is_reserve, is_alt,tag_suffix)
+        VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7)
+        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt,tag_suffix
         "#,
-        id, raid_id, user_id, main_now, joined_as, !main_now
+        id, raid_id, user_id, main_now, joined_as, !main_now,tag_suffix
     ).fetch_one(pool).await?;
     Ok(row)
 }
@@ -165,16 +166,17 @@ pub async fn insert_alt(
     user_id: i64,
     joined_as: String,
     main_now: bool, // if false → reserve alt
+    tag_suffix: String,
 ) -> anyhow::Result<RaidParticipant> {
     let id = Uuid::new_v4();
     let row = sqlx::query_as!(
         RaidParticipant,
         r#"
-        INSERT INTO raid_participants (id, raid_id, user_id, is_main, joined_as, is_reserve, is_alt)
-        VALUES ($1,$2,$3,$4,$5,$6,TRUE)
-        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt
+        INSERT INTO raid_participants (id, raid_id, user_id, is_main, joined_as, is_reserve, is_alt,tag_suffix)
+        VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7)
+        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt,tag_suffix
         "#,
-        id, raid_id, user_id, main_now, joined_as, !main_now
+        id, raid_id, user_id, main_now, joined_as, !main_now,tag_suffix
     ).fetch_one(pool).await?;
     Ok(row)
 }

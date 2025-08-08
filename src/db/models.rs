@@ -35,4 +35,5 @@ pub struct RaidParticipant {
     pub is_reserve: bool,
     pub joined_at: DateTime<Utc>,
     pub is_alt: bool,
+    pub tag_suffix: String,
 }
