@@ -1,8 +1,9 @@
 use super::models::{Raid, RaidParticipant};
 use chrono::{DateTime, Utc};
+use serenity::all::{CreateMessage, UserId};
 use sqlx::{types::Json, PgPool};
 use uuid::Uuid;
-
+use crate::db::repo;
 /* RAIDS */
 
 pub async fn create_raid_with_id(
@@ -100,19 +101,13 @@ pub async fn count_alt_mains(pool: &PgPool, raid_id: Uuid) -> anyhow::Result<i64
 }
 
 pub async fn user_has_main(pool: &PgPool, raid_id: Uuid, user_id: i64) -> anyhow::Result<bool> {
-    // SELECT EXISTS returns a plain bool for Postgres; no unwrap needed.
-    let rec = sqlx::query_scalar!(
-        r#"SELECT EXISTS(
-            SELECT 1 FROM raid_participants
-            WHERE raid_id=$1 AND user_id=$2 AND is_main=TRUE AND is_alt=FALSE
-        )"#,
-        raid_id,
-        user_id
-    )
-        .fetch_one(pool)
-        .await?;
-    Ok(rec.expect("REASON"))
+    let parts: Vec<RaidParticipant> = list_participants(pool, raid_id).await?;
+    let has = parts.iter().any(|p| {
+        p.user_id == user_id && p.is_main
+    });
+    Ok(has)
 }
+
 
 
 pub async fn alt_count_for_user(pool: &PgPool, raid_id: Uuid, user_id: i64) -> anyhow::Result<i64> {
@@ -188,6 +183,16 @@ pub async fn remove_participant(pool: &PgPool, raid_id: Uuid, user_id: i64) -> a
     )
         .execute(pool)
         .await?;
+    let parts = repo::list_participants(&pool, raid_id).await?;
+
+    Ok(res.rows_affected())
+}
+pub async fn remove_participant_by_id(pool: &PgPool,raid: Uuid, participant_id: Uuid) -> anyhow::Result<u64> {
+    let res = sqlx::query!(
+        "DELETE FROM raid_participants WHERE raid_id = $1 AND id = $2",
+        raid, participant_id
+    )
+        .execute(pool).await?;
     Ok(res.rows_affected())
 }
 
@@ -267,3 +272,12 @@ pub async fn promote_reserves_with_alt_limits(
 
     Ok(())
 }
+
+// pub async fn user_has_main(pool: &PgPool, raid_id: Uuid, user_id: i64) -> anyhow::Result<bool> {
+//     let parts: Vec<RaidParticipant> = list_participants(pool, raid_id).await?;
+//     let has = parts.iter().any(|p| {
+//         // Adjust field names if they differ in your model
+//         p.user_id == user_id && p.is_main
+//     });
+//     Ok(has)
+// }

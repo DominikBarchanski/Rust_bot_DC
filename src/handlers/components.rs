@@ -4,6 +4,7 @@ use crate::ui::{embeds, menus};
 use crate::utils::{from_user_id, parse_component_id};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+use chrono::{DateTime,Duration as DD ,Utc};
 use serenity::all::*;
 use serenity::builder::{
     CreateInteractionResponse,
@@ -37,6 +38,7 @@ pub async fn handle_component(ctx: &Context, it: &ComponentInteraction) -> anyho
         ("la", "") => leave_alts(ctx, it, raid_id).await?,
         ("mg", "") => owner_manage(ctx, it, raid_id).await?,
         ("pr", "") => owner_promote(ctx, it, raid_id).await?,
+        ("mr", "") => owner_move_to_reserve(ctx, it, raid_id).await?,
         ("kk", "") => owner_kick(ctx, it, raid_id).await?,
         ("cx", "") => owner_cancel(ctx, it, raid_id).await?,
         ("cl", "") => close_ephemeral(ctx,it).await?,
@@ -139,7 +141,7 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     if !raid.is_active {
         it.create_response(&ctx.http, CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
-                .content("This raid has been canceled.")
+                .content("This raid has been cancelled.")
                 .ephemeral(true)
         )).await?;
         return Ok(());
@@ -189,6 +191,22 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
             }
         }
     }
+    let alt_allow_role_name = std::env::var("ALT_ALLOW_ROLE_NAME").unwrap_or_else(|_| "Alt_allow".to_string());
+    let mut has_alt_allow_role = false;
+    if let Some(gid) = it.guild_id {
+        let roles_map = gid.roles(&ctx.http).await?;
+        if let Ok(member) = gid.member(&ctx.http, it.user.id).await {
+            for rid in &member.roles {
+                if let Some(r) = roles_map.get(rid) {
+                    if r.name.eq_ignore_ascii_case(&alt_allow_role_name) {
+                        has_alt_allow_role = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
 
     // Priority: if window active and user lacks priority role → reserve
     let mut must_reserve = force_reserve;
@@ -211,8 +229,30 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     // Prepare fields
     let joined_as = format!("{} / {}", sel.class.unwrap(), sel.sp.unwrap());
     let is_alt_join = !sel.main;
+    let requester_id = from_user_id(it.user.id);
+
+
+    if is_alt_join && !repo::user_has_main(&pool, raid_id, requester_id).await? {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("You have to sign as a main before add alt.")
+                .ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+
 
     if is_alt_join {
+
+        if !has_alt_allow_role {
+            it.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(&format!("You are not allowed to sign in an alt. Missing role: {}", alt_allow_role_name))
+                    .ephemeral(true)
+            )).await?;
+            return Ok(());
+        }
+
         if !raid.allow_alts {
             it.create_response(&ctx.http, CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new().content("Alts are disabled for this raid.").ephemeral(true)
@@ -273,12 +313,47 @@ async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> a
     if !raid.is_active {
         it.create_response(&ctx.http, CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
-                .content("This raid has been canceled.")
+                .content("This raid has been cancelled.")
                 .ephemeral(true)
         )).await?;
         return Ok(());
     }
-    let _ = repo::remove_participant(&pool, raid_id, from_user_id(it.user.id)).await?;
+    let removed_main = repo::remove_participant(&pool, raid_id, from_user_id(it.user.id)).await?;
+    let user_id = from_user_id(it.user.id);
+    let removed_alts = repo::remove_user_alts(&pool, raid_id, user_id).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    let time_left = human_time_left(raid.scheduled_for);
+    let owner_id = UserId::new(raid.owner_id as u64);
+    let dm = owner_id.create_dm_channel(&ctx.http).await?;
+    if removed_main == 0 && removed_alts == 0 {
+        // Already signed out — don't notify owner/channel again
+        return refresh_message(ctx, it, raid_id, "You were already signed out.").await;
+    }
+
+    dm.id
+        .send_message(
+            &ctx.http,
+            CreateMessage::new().content(format!(
+                "Heads up: user <@{user}> signed off from raid \"{name}\".\nChannel: <#{chan}>\nStarts in: {left}",
+                user = user_id,
+                name = raid.raid_name,
+                chan = raid.channel_id as u64,
+                left = time_left
+            )),
+        )
+        .await?;
+
+    ChannelId::new(raid.channel_id as u64)
+        .send_message(
+            &ctx.http,
+            CreateMessage::new().content(format!(
+                "<@{user}> signed off. Raid starts in {left}.",
+                user = user_id,
+                left = time_left
+            )),
+        )
+        .await?;
+
     refresh_message(ctx, it, raid_id, "You have been signed out.").await
 }
 
@@ -288,12 +363,11 @@ async fn leave_alts(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
     if !raid.is_active {
         it.create_response(&ctx.http, CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
-                .content("This raid has been canceled. ")
+                .content("This raid has been cancelled. ")
                 .ephemeral(true)
         )).await?;
         return Ok(());
     }
-    let _ = repo::remove_user_alts(&pool, raid_id, from_user_id(it.user.id)).await?;
     refresh_message(ctx, it, raid_id, "Removed your alts.").await
 }
 
@@ -324,7 +398,7 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     if !raid.is_active {
         it.create_response(&ctx.http, CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
-                .content("This raid has been canceled. Managing is no longer available.")
+                .content("This raid has been cancelled. Managing is no longer available.")
                 .ephemeral(true)
         )).await?;
         return Ok(());
@@ -335,8 +409,17 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     // reserves-only options for Promote
     let mut promote_opts: Vec<(String,String)> = parts.iter()
         .filter(|p| !p.is_main)
-        .map(|p| (format!("{} <@{}>{}", p.joined_as, p.user_id, if p.is_alt {" (ALT)"} else {""}), p.user_id.to_string()+if p.is_alt { " ALT" } else { "" }))
+        .map(|p| (format!("{} <@{}>{}", p.joined_as, p.user_id,
+                          if p.is_alt {" (ALT)"} else {""}), p.id.to_string()))
         .collect();
+    let mut promote_to_reserve_opts: Vec<(String,String)> = parts.iter()
+        .filter(|p| p.is_main)
+        .map(|p| (format!("{} <@{}>{}", p.joined_as, p.user_id,
+                          if p.is_alt {" (ALT)"} else {""}), p.id.to_string()))
+        .collect();
+    if promote_to_reserve_opts.is_empty() {
+        promote_to_reserve_opts.push(("No reserves".into(), "none".into()));
+    }
 
 
     if promote_opts.is_empty() {
@@ -348,7 +431,7 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         .map(|p| (format!("{} <@{}>{}{}", p.joined_as, p.user_id,
                           if p.is_main {" [MAIN]"} else {" [RES]"},
                           if p.is_alt {" (ALT)"} else {""}),
-                  p.user_id.to_string()+if p.is_alt {" (ALT)"} else {""}))
+                  p.id.to_string()))
         .collect();
 
     if kick_opts.is_empty() {
@@ -361,7 +444,8 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
             .ephemeral(true)
             .components(vec![
                 menus::user_select_row(format!("r:pr:{raid_id}"), "Promote reserve → main", promote_opts),
-                menus::user_select_row(format!("r:kk:{raid_id}"), "Kick user (all entries)", kick_opts),
+                menus::user_select_row(format!("r:mr:{raid_id}"), "Promote main → reserve ", promote_to_reserve_opts),
+                menus::user_select_row(format!("r:kk:{raid_id}"), "Kick user ", kick_opts),
                 CreateActionRow::Buttons(vec![
                     CreateButton::new(format!("r:cx:{raid_id}"))
                         .label("Cancel Raid (DM all + delete in 1h)")
@@ -383,7 +467,7 @@ async fn owner_promote(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) 
     if let ComponentInteractionDataKind::StringSelect { values } = &it.data.kind {
         let Some(uid_s) = values.first() else { return Ok(()); };
         if uid_s == "none" { return Ok(()); }
-        let uid: i64 = uid_s.parse().ok().unwrap_or(0);
+        let uid: Uuid = uid_s.parse().ok().unwrap_or(Default::default());
 
         // is there room?
         let mains = repo::count_mains(&pool, raid_id).await? as i32;
@@ -399,7 +483,7 @@ async fn owner_promote(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) 
             r#"
             WITH c AS (
               SELECT id FROM raid_participants
-              WHERE raid_id = $1 AND user_id = $2 AND is_main = FALSE
+              WHERE raid_id = $1 AND id = $2 AND is_main = FALSE
               ORDER BY is_alt ASC, joined_at ASC
               LIMIT 1
             )
@@ -425,6 +509,48 @@ async fn owner_promote(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) 
     }
     Ok(())
 }
+async fn owner_move_to_reserve(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
+    let pool = pool_from_ctx(ctx).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    if raid.owner_id != it.user.id.get() as i64 { return Ok(()); }
+    if let ComponentInteractionDataKind::StringSelect { values } = &it.data.kind {
+        let Some(uid_s) = values.first() else { return Ok(()); };
+        if uid_s == "none" { return Ok(()); }
+        let uid: Uuid = uid_s.parse().ok().unwrap_or(Default::default());
+
+        // is there room?
+
+        // promote the oldest reserve row for that user (prefer non-alt)
+        let _ = sqlx::query!(
+            r#"
+            WITH c AS (
+              SELECT id FROM raid_participants
+              WHERE raid_id = $1 AND id = $2 AND is_main = TRUE
+              ORDER BY is_alt ASC, joined_at ASC
+              LIMIT 1
+            )
+            UPDATE raid_participants p
+            SET is_main = FALSE, is_reserve = TRUE
+            FROM c
+            WHERE p.id = c.id
+            "#,
+            raid_id, uid
+        ).execute(&pool).await?;
+
+        // if it was an alt, ensure we don't exceed alt cap—(owner override leaves as-is)
+        // refresh
+        let parts = repo::list_participants(&pool, raid_id).await?;
+        let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
+        ChannelId::new(raid.channel_id as u64)
+            .edit_message(&ctx.http, raid.message_id as u64,
+                          EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)])).await?;
+
+        it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
+            CreateInteractionResponseMessage::new().content("Moved to reserve.")
+        )).await?;
+    }
+    Ok(())
+}
 
 async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
     let pool = pool_from_ctx(ctx).await?;
@@ -434,9 +560,9 @@ async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
     if let ComponentInteractionDataKind::StringSelect { values } = &it.data.kind {
         let Some(uid_s) = values.first() else { return Ok(()); };
         if uid_s == "none" { return Ok(()); }
-        let uid: i64 = uid_s.parse().ok().unwrap_or(0);
+        let uid: Uuid = uid_s.parse().ok().unwrap_or(Default::default());
 
-        let _ = repo::remove_participant(&pool, raid_id, uid).await?;
+        let _ = repo::remove_participant_by_id(&pool, raid_id, uid).await?;
 
         let parts = repo::list_participants(&pool, raid_id).await?;
         let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
@@ -461,14 +587,14 @@ async fn owner_cancel(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     for p in &parts {
         if let Ok(ch) = UserId::new(p.user_id as u64).create_dm_channel(&ctx.http).await {
             let _ = ch.id.send_message(&ctx.http, CreateMessage::new()
-                .content(format!("Raid `{}` was canceled.", raid.raid_name))
+                .content(format!("Raid `{}` was cancelled.", raid.raid_name))
             ).await;
         }
     }
 
     let embed = CreateEmbed::new()
-        .title(format!("Raid: {} (CANCELED)", raid.raid_name))
-        .description("This raid has been canceled by the owner.");
+        .title(format!("Raid: {} (CANCELLED)", raid.raid_name))
+        .description("This raid has been cancelled by the owner.");
     ChannelId::new(raid.channel_id as u64)
         .edit_message(&ctx.http, raid.message_id as u64, EditMessage::new().embed(embed)).await?;
 
@@ -482,7 +608,7 @@ async fn owner_cancel(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     });
 
     it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
-        CreateInteractionResponseMessage::new().content("Raid canceled. Channel will delete in ~2h.")
+        CreateInteractionResponseMessage::new().content("Raid cancelled. Channel will delete in ~2h.")
     )).await?;
     Ok(())
 }
@@ -526,3 +652,32 @@ async fn close_ephemeral(ctx: &Context, it: &ComponentInteraction) -> anyhow::Re
     Ok(())
 }
 
+fn human_time_left(when: DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let mut d = when.signed_duration_since(now);
+    if d.num_seconds() <= 0 {
+        return "now".to_string();
+    }
+
+    let days = d.num_days();
+    d -= DD::days(days);
+    let hours = d.num_hours();
+    d -= DD::hours(hours);
+    let mins = d.num_minutes();
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{}d", days));
+    }
+    if hours > 0 {
+        parts.push(format!("{}h", hours));
+    }
+    if mins > 0 && parts.len() < 2 {
+        // Keep it concise: include minutes if useful and not too verbose.
+        parts.push(format!("{}m", mins));
+    }
+    if parts.is_empty() {
+        parts.push("<1m".to_string());
+    }
+    parts.join(" ")
+}

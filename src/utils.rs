@@ -21,6 +21,7 @@ pub fn parse_component_id(s: &str) -> Option<(String, String, Uuid)> {
         ["ps",uuid]    => uuid.parse().ok().map(|u| ("ps".into(),"".into(),u)),
         ["ok",uuid]    => uuid.parse().ok().map(|u| ("ok".into(),"".into(),u)),
         ["pr",uuid]    => uuid.parse().ok().map(|u| ("pr".into(),"".into(),u)),
+        ["mr",uuid]    => uuid.parse().ok().map(|u| ("mr".into(),"".into(),u)),
         ["kk",uuid]    => uuid.parse().ok().map(|u| ("kk".into(),"".into(),u)),
         ["cx",uuid]    => uuid.parse().ok().map(|u| ("cx".into(),"".into(),u)),
         _ => None,
