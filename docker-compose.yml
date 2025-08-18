@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: raid_user
+      POSTGRES_PASSWORD: raid_pass
+      POSTGRES_DB: raid_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+
+  bot:
+    build: ./bot
+    depends_on:
+      - postgres
+    env_file:
+      - ./bot/.env
+    restart: unless-stopped
+
+volumes:
+  pgdata:
