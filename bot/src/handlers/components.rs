@@ -368,6 +368,7 @@ async fn leave_alts(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
         )).await?;
         return Ok(());
     }
+    let _ = repo::remove_user_alts(&pool, raid_id, from_user_id(it.user.id)).await?;
     refresh_message(ctx, it, raid_id, "Removed your alts.").await
 }
 
