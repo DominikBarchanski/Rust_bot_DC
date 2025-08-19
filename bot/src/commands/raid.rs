@@ -7,7 +7,7 @@ use crate::handlers::pool_from_ctx;
 use crate::ui::{embeds, menus};
 use crate::utils::{parse_raid_datetime, weekday_key};
 use crate::tasks;
-use chrono::{DateTime, Utc};
+use crate::utils::extract_duration_hours;
 use chrono_tz::Europe::Warsaw;
 
 pub async fn register(ctx: &Context) -> anyhow::Result<()> {
@@ -44,6 +44,28 @@ pub async fn register(ctx: &Context) -> anyhow::Result<()> {
     ).await?;
     Ok(())
 }
+fn emoji_and_slug(raid_choice: &str) -> (&'static str, String) {
+    // Normalize name: lowercase and replace separators with hyphens
+    let slug = raid_choice
+        .to_lowercase()
+        .replace(' ', "-")
+        .replace('_', "-");
+
+    // Pick emoji
+    let emoji = match slug.as_str() {
+        "armav2" => "🦾",
+        "arma" => "🤖",
+        "pollutus" => "🦠",
+        "azgobas" => "🐉",
+        "valehir" => "💀",
+        "alzanor" => "🥶",
+        s if s.starts_with("hc-") => "🔥", // Hc_* variants
+        _ => "🏷️", // fallback
+    };
+
+    (emoji, slug)
+}
+
 
 pub async fn register_kick(ctx: &Context) -> anyhow::Result<()> {
     Command::create_global_command(
@@ -156,9 +178,14 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
         if c.kind == ChannelType::Category && c.name.to_lowercase().contains(weekday) { Some(c.id) } else { None }
     });
     let when_local = scheduled_for.with_timezone(&Warsaw);
-    let chan_name = format!("{}-{}-{}", raid_name.replace('_', "-"),
-                            when_local.format("%m_%d"),
-                            when_local.format("%H_%M"));
+    let (emoji, name_slug) = emoji_and_slug(&raid_name);
+    let date = when_local.format("%d-%m");
+    let time = when_local.format("%H_%M");
+
+    let chan_name = format!("{emoji}-{name_slug}-{date} at {time}",
+
+    );
+
 
     let text_channel = match category_id {
         Some(cat) => {
@@ -171,6 +198,7 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
 
     let raid_id = Uuid::new_v4();
     let embed = embeds::render_new_raid_embed(&raid_name, &description, scheduled_for, &max_players);
+    let (_desc_clean, dur_h) = extract_duration_hours(&description);
     let msg = text_channel.id.send_message(
         &ctx.http,
         CreateMessage::new()
@@ -209,11 +237,18 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
             until,
         );
     }
+    let duration_for_schedule:i64 = dur_h.ceil() as i64;
     tasks::schedule_auto_delete(
         ctx.http.clone(),
         raid_id,
         text_channel.id.get() as i64,
-        scheduled_for + chrono::Duration::minutes(20),
+        scheduled_for + chrono::Duration::hours(duration_for_schedule) +chrono::Duration::minutes(20),
+    );
+    tasks::schedule_raid_15m_reminder(
+        ctx.http.clone(),
+        pool_from_ctx(ctx).await?,
+        raid_id,
+        scheduled_for - chrono::Duration::minutes(15),
     );
 
     cmd.create_response(&ctx.http, CreateInteractionResponse::Message(

@@ -1,8 +1,9 @@
 use crate::db::repo;
 use crate::handlers::pool_from_ctx;
 use crate::ui::{embeds, menus};
-use crate::utils::{from_user_id, parse_component_id};
+use crate::utils::{from_user_id, parse_component_id,mention_user,user_name,user_name_in_guild,user_name_best,notify_raid_now,dm_user,ORGANISER_ROLE_NAME};
 use dashmap::DashMap;
+use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use chrono::{DateTime,Duration as DD ,Utc};
 use serenity::all::*;
@@ -11,6 +12,7 @@ use serenity::builder::{
     CreateInteractionResponseMessage,
     EditInteractionResponse,
 };
+use chrono_tz::Europe::Warsaw;
 use serenity::builder::{EditMessage, CreateMessage};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
@@ -24,7 +26,7 @@ struct JoinSelection {
 }
 
 static JOIN_STATE: Lazy<DashMap<(u64, Uuid), JoinSelection>> = Lazy::new(DashMap::new);
-
+static OWNER_CHANGE: Lazy<DashMap<(u64, Uuid), u64>> = Lazy::new(DashMap::new);
 pub async fn handle_component(ctx: &Context, it: &ComponentInteraction) -> anyhow::Result<()> {
     let Some((kind, which, raid_id)) = parse_component_id(&it.data.custom_id) else { return Ok(()); };
 
@@ -42,6 +44,10 @@ pub async fn handle_component(ctx: &Context, it: &ComponentInteraction) -> anyho
         ("kk", "") => owner_kick(ctx, it, raid_id).await?,
         ("cx", "") => owner_cancel(ctx, it, raid_id).await?,
         ("cl", "") => close_ephemeral(ctx,it).await?,
+        ("not", "") => notify_raid_now(ctx,raid_id).await?,
+        ("cho", "") => owner_change_start(ctx, it, raid_id).await?,   // show picker
+        ("chp", "") => owner_change_pick(ctx, it, raid_id).await?,    // store pick
+        ("chc", "") => owner_change_confirm(ctx, it, raid_id).await?, // confirm + transfer
         _ => {}
     }
 
@@ -334,8 +340,8 @@ async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> a
         .send_message(
             &ctx.http,
             CreateMessage::new().content(format!(
-                "Heads up: user <@{user}> signed off from raid \"{name}\".\nChannel: <#{chan}>\nStarts in: {left}",
-                user = user_id,
+                "Heads up: user {user} signed off from raid \"{name}\".\nChannel: <#{chan}>\nStarts in: {left}",
+                user = mention_user(user_id),
                 name = raid.raid_name,
                 chan = raid.channel_id as u64,
                 left = time_left
@@ -404,20 +410,71 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         )).await?;
         return Ok(());
     }
-
+    let gid_u64 = raid.guild_id as u64;
+    let mut name_map: HashMap<i64, String> = HashMap::new();
 
     let parts = repo::list_participants(&pool, raid_id).await?;
+
+    for p in &parts {
+        if !name_map.contains_key(&p.user_id) {
+            let name = user_name_best(ctx, Some(gid_u64), p.user_id).await;
+            name_map.insert(p.user_id, name);
+        }
+    }
+
+
     // reserves-only options for Promote
-    let mut promote_opts: Vec<(String,String)> = parts.iter()
+    let mut promote_opts: Vec<(String, String)> = parts
+        .iter()
         .filter(|p| !p.is_main)
-        .map(|p| (format!("{} <@{}>{}", p.joined_as, p.user_id,
-                          if p.is_alt {" (ALT)"} else {""}), p.id.to_string()))
+        .map(|p| {
+            let name = name_map.get(&p.user_id)
+                .cloned()
+                .unwrap_or_else(|| format!("user {}", p.user_id));
+            (
+                format!("{} {}{}", p.joined_as, name, if p.is_alt { " (ALT)" } else { "" }),
+                p.id.to_string(),
+            )
+        })
         .collect();
-    let mut promote_to_reserve_opts: Vec<(String,String)> = parts.iter()
+
+    let mut promote_to_reserve_opts: Vec<(String, String)> = parts
+        .iter()
         .filter(|p| p.is_main)
-        .map(|p| (format!("{} <@{}>{}", p.joined_as, p.user_id,
-                          if p.is_alt {" (ALT)"} else {""}), p.id.to_string()))
+        .map(|p| {
+            let name = name_map.get(&p.user_id)
+                .cloned()
+                .unwrap_or_else(|| format!("user {}", p.user_id));
+            (
+                format!("{} {}{}", p.joined_as, name, if p.is_alt { " (ALT)" } else { "" }),
+                p.id.to_string(),
+            )
+        })
         .collect();
+
+    let mut kick_opts: Vec<(String, String)> = parts
+        .iter()
+        .map(|p| {
+            let name = name_map.get(&p.user_id)
+                .cloned()
+                .unwrap_or_else(|| format!("user {}", p.user_id));
+            (
+                format!(
+                    "{} {}{}{}",
+                    p.joined_as,
+                    name,
+                    if p.is_main { " [MAIN]" } else { " [RES]" },
+                    if p.is_alt { " (ALT)" } else { "" }
+                ),
+                p.id.to_string(),
+            )
+        })
+        .collect();
+
+    if kick_opts.is_empty() {
+        kick_opts.push(("No participants".into(), "none".into()));
+    }
+
     if promote_to_reserve_opts.is_empty() {
         promote_to_reserve_opts.push(("No reserves".into(), "none".into()));
     }
@@ -428,16 +485,7 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     }
 
     // Any participants for Kick
-    let mut kick_opts: Vec<(String,String)> = parts.iter()
-        .map(|p| (format!("{} <@{}>{}{}", p.joined_as, p.user_id,
-                          if p.is_main {" [MAIN]"} else {" [RES]"},
-                          if p.is_alt {" (ALT)"} else {""}),
-                  p.id.to_string()))
-        .collect();
 
-    if kick_opts.is_empty() {
-        kick_opts.push(("No participants".into(), "none".into()));
-    }
 
     it.create_response(&ctx.http, CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()
@@ -454,6 +502,12 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
                     CreateButton::new(format!("r:cl:{raid_id}"))
                         .label("Close")
                         .style(ButtonStyle::Secondary),
+                    CreateButton::new(format!("r:not:{raid_id}"))
+                        .label("Notify All Participants ")
+                        .style(ButtonStyle::Secondary),
+                    CreateButton::new(format!("r:cho:{raid_id}"))
+                        .label("Change Owner")
+                        .style(ButtonStyle::Primary),
                 ])
             ])
     )).await?;
@@ -478,7 +532,10 @@ async fn owner_promote(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) 
             )).await?;
             return Ok(());
         }
-
+        let target_user: Option<i64> = sqlx::query_scalar!(
+            "SELECT user_id FROM raid_participants WHERE id = $1 AND raid_id = $2",
+            uid, raid_id
+        ).fetch_optional(&pool).await?;
         // promote the oldest reserve row for that user (prefer non-alt)
         let _ = sqlx::query!(
             r#"
@@ -496,6 +553,14 @@ async fn owner_promote(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) 
             raid_id, uid
         ).execute(&pool).await?;
 
+        if let Some(uid) = target_user {
+            let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
+            let msg = format!(
+                "✅ You were **promoted to MAIN** for **{}** on {}.\nChannel: <#{}>",
+                raid.raid_name, when_local, raid.channel_id as u64
+            );
+            dm_user(&ctx.http, uid as u64, msg).await;
+        }
         // if it was an alt, ensure we don't exceed alt cap—(owner override leaves as-is)
         // refresh
         let parts = repo::list_participants(&pool, raid_id).await?;
@@ -520,7 +585,10 @@ async fn owner_move_to_reserve(ctx: &Context, it: &ComponentInteraction, raid_id
         let uid: Uuid = uid_s.parse().ok().unwrap_or(Default::default());
 
         // is there room?
-
+        let target_user: Option<i64> = sqlx::query_scalar!(
+            "SELECT user_id FROM raid_participants WHERE id = $1 AND raid_id = $2",
+            uid, raid_id
+        ).fetch_optional(&pool).await?;
         // promote the oldest reserve row for that user (prefer non-alt)
         let _ = sqlx::query!(
             r#"
@@ -537,6 +605,14 @@ async fn owner_move_to_reserve(ctx: &Context, it: &ComponentInteraction, raid_id
             "#,
             raid_id, uid
         ).execute(&pool).await?;
+        if let Some(uid) = target_user {
+            let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
+            let msg = format!(
+                "↩️ You were **moved to RESERVE** for **{}** on {}.\nChannel: <#{}>",
+                raid.raid_name, when_local, raid.channel_id as u64
+            );
+            dm_user(&ctx.http, uid as u64, msg).await;
+        }
 
         // if it was an alt, ensure we don't exceed alt cap—(owner override leaves as-is)
         // refresh
@@ -681,4 +757,212 @@ fn human_time_left(when: DateTime<Utc>) -> String {
         parts.push("<1m".to_string());
     }
     parts.join(" ")
+}
+
+async fn owner_change_start(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
+    let pool = pool_from_ctx(ctx).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    if raid.owner_id != it.user.id.get() as i64 {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Only the raid owner can change owner.").ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+    if !raid.is_active {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("This raid has been cancelled.").ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+
+    let gid = match it.guild_id {
+        Some(g) => g,
+        None => {
+            it.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content("Must be used in a guild.").ephemeral(true)
+            )).await?;
+            return Ok(());
+        }
+    };
+
+    // Find organiser role id
+    let roles_map = gid.roles(&ctx.http).await?;
+    let organiser_role_id = match roles_map.iter()
+        .find(|(_, r)| r.name.eq_ignore_ascii_case(ORGANISER_ROLE_NAME))
+        .map(|(id, _)| *id)
+    {
+        Some(id) => id,
+        None => {
+            it.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("Role `{}` not found on this server.", ORGANISER_ROLE_NAME))
+                    .ephemeral(true)
+            )).await?;
+            return Ok(());
+        }
+    };
+
+    // Collect members with organiser role (paginate; cap at 25 for Discord select)
+    let mut after: Option<UserId> = None;
+    let mut organisers: Vec<UserId> = Vec::new();
+    loop {
+        let chunk = gid.members(&ctx.http, Some(1000), after).await?;
+        if chunk.is_empty() { break; }
+        for m in &chunk {
+            if m.user.id.get() as i64 != raid.owner_id && m.roles.contains(&organiser_role_id) {
+                organisers.push(m.user.id);
+            }
+        }
+        after = chunk.last().map(|m| m.user.id);
+        if chunk.len() < 1000 { break; }
+    }
+
+    // Build options (label, value) — value = Discord user id as string
+    // NOTE: Discord StringSelect allows max 25 options.
+    organisers.sort_by_key(|u| u.get());
+    let mut options: Vec<(String, String)> = Vec::new();
+    for uid in organisers.iter().take(25) {
+        let label = user_name_best(ctx, Some(gid.get()), uid.get() as i64).await;
+        options.push((label, uid.get().to_string()));
+    }
+
+    if options.is_empty() {
+        options.push((format!("No users with role {}", ORGANISER_ROLE_NAME), "none".into()));
+    }
+
+    OWNER_CHANGE.remove(&(it.user.id.get(), raid_id)); // reset previous pick if any
+
+    it.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new()
+            .content(format!("Pick a new owner (role: `{}`), then press **Transfer ownership**.", ORGANISER_ROLE_NAME))
+            .ephemeral(true)
+            .components(vec![
+                menus::user_select_row(format!("r:chp:{raid_id}"), "New owner", options),
+                CreateActionRow::Buttons(vec![
+                    CreateButton::new(format!("r:chc:{raid_id}"))
+                        .label("Transfer ownership")
+                        .style(ButtonStyle::Primary),
+                    CreateButton::new(format!("r:cl:{raid_id}"))
+                        .label("Close")
+                        .style(ButtonStyle::Secondary),
+                ])
+            ])
+    )).await?;
+
+    Ok(())
+}
+
+async fn owner_change_pick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
+    // Store the selected Discord user id (as u64)
+    if let ComponentInteractionDataKind::StringSelect { values } = &it.data.kind {
+        let Some(sel) = values.first() else { return Ok(()); };
+        if sel == "none" {
+            it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
+                CreateInteractionResponseMessage::new().content("No eligible users to pick.")
+            )).await?;
+            return Ok(());
+        }
+        if let Ok(uid64) = sel.parse::<u64>() {
+            OWNER_CHANGE.insert((it.user.id.get(), raid_id), uid64);
+            let picked = user_name(ctx, uid64 as i64);
+            it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("Selected new owner: **{}**. Now click **Transfer ownership**.", picked))
+            )).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn owner_change_confirm(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
+    let pool = pool_from_ctx(ctx).await?;
+    let mut raid = repo::get_raid(&pool, raid_id).await?;
+    if raid.owner_id != it.user.id.get() as i64 {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Only the raid owner can change owner.").ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+    if !raid.is_active {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("This raid has been cancelled.").ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+
+    let key = (it.user.id.get(), raid_id);
+    let Some(&new_owner_u64) = OWNER_CHANGE.get(&key).as_deref() else {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("Pick a new owner first.")
+                .ephemeral(true)
+        )).await?;
+        return Ok(());
+    };
+
+    if new_owner_u64 == it.user.id.get() {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("You’re already the owner.")
+                .ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+
+    // Optional: verify the selected still has organiser role
+    if let Some(gid) = it.guild_id {
+        let roles_map = gid.roles(&ctx.http).await?;
+        if let Some(role_id) = roles_map.iter()
+            .find(|(_, r)| r.name.eq_ignore_ascii_case(ORGANISER_ROLE_NAME))
+            .map(|(id, _)| *id)
+        {
+            if let Ok(member) = gid.member(&ctx.http, UserId::new(new_owner_u64)).await {
+                if !member.roles.contains(&role_id) {
+                    it.create_response(&ctx.http, CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("Selected user no longer has `{}` role.", ORGANISER_ROLE_NAME))
+                            .ephemeral(true)
+                    )).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Update DB
+    sqlx::query!("UPDATE raids SET owner_id = $1 WHERE id = $2", new_owner_u64 as i64, raid_id)
+        .execute(&pool)
+        .await?;
+
+    // Notify both owners
+    let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
+    let old_owner_u64 = raid.owner_id as u64;
+    let new_owner_name = user_name(ctx, new_owner_u64 as i64);
+
+    dm_user(&ctx.http, new_owner_u64, format!(
+        "👑 You are now **owner** of raid **{}** ({}). Channel: <#{}>",
+        raid.raid_name, when_local, raid.channel_id as u64
+    )).await;
+
+    dm_user(&ctx.http, old_owner_u64, format!(
+        "↪️ Ownership of **{}** transferred to **{}**.",
+        raid.raid_name, new_owner_name
+    )).await;
+
+    // Refresh message
+    raid = repo::get_raid(&pool, raid_id).await?;
+    let parts = repo::list_participants(&pool, raid_id).await?;
+    let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
+    ChannelId::new(raid.channel_id as u64)
+        .edit_message(&ctx.http, raid.message_id as u64,
+                      EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)]))
+        .await?;
+
+    OWNER_CHANGE.remove(&key);
+
+    it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
+        CreateInteractionResponseMessage::new().content(format!("Ownership transferred to **{}**.", new_owner_name))
+    )).await?;
+
+    Ok(())
 }

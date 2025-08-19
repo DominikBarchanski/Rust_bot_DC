@@ -1,6 +1,5 @@
 use super::models::{Raid, RaidParticipant};
 use chrono::{DateTime, Utc};
-use serenity::all::{CreateMessage, UserId};
 use sqlx::{types::Json, PgPool};
 use uuid::Uuid;
 use crate::db::repo;
@@ -183,7 +182,7 @@ pub async fn remove_participant(pool: &PgPool, raid_id: Uuid, user_id: i64) -> a
     )
         .execute(pool)
         .await?;
-    let parts = repo::list_participants(&pool, raid_id).await?;
+    let _parts = repo::list_participants(&pool, raid_id).await?;
 
     Ok(res.rows_affected())
 }

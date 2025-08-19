@@ -1,15 +1,20 @@
-use serenity::all::{Context, CreateEmbed,GuildId,UserId};
+use serenity::all::{Context, CreateEmbed};
 use crate::db::models::{Raid, RaidParticipant};
 use crate::utils::emoji_tag;
-use chrono::{DateTime, Utc};
+use crate::utils::mention_user;
+use crate::utils::extract_duration_hours;
+use crate::utils::fmt_hours;
 use chrono_tz::Europe::Warsaw;
 
 pub fn render_new_raid_embed(raid_name: &str, description: &str, scheduled_for: chrono::DateTime<chrono::Utc>, max_player:&i64) -> CreateEmbed {
+    let (desc_clean, dur_h) = extract_duration_hours(description);
+    let dur_str = fmt_hours(dur_h);
     let when_local = scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
     CreateEmbed::new()
         .title(format!("Raid: {}", raid_name))
+        .field("Duration", dur_str, true)
+        .field("Description", desc_clean, false)
         .description(format!("**Date:** {}\n{}", when_local, render_empty_slots(*max_player )))
-        .field("Description", description, false)
 }
 
 pub fn render_raid_embed(ctx: &Context, guild_id: u64, raid: &Raid, participants: &[RaidParticipant]) -> CreateEmbed {
@@ -36,16 +41,20 @@ fn render_raid_embed_inner(ctx_guild: Option<(&Context, u64)>, raid: &Raid, part
             let label = decorate_joined_as(ctx_guild, &p.joined_as);
             let suffix_role = p.tag_suffix.as_str();
             let suffix = if p.is_alt { " (ALT)" } else { "" };
-            lines.push(format!("{}. {} <@{}>{}{}", i + 1, label, p.user_id, suffix,suffix_role));
+            lines.push(format!("{}. {} {} {}{}", i + 1, label, mention_user( p.user_id), suffix,suffix_role));
         } else {
             lines.push(format!("{}. [Empty]", i + 1));
         }
     }
+    let (desc_clean, dur_h) = extract_duration_hours(&raid.description);
+    let dur_str = fmt_hours(dur_h);
     let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
     let mut e = CreateEmbed::new()
         .title(format!("Raid: {}", raid.raid_name))
+        .field("Duration", dur_str, true)
         .description(format!("**Date:** {}\n{}", when_local, lines.join("\n")))
-        .field("Description", &raid.description, false)
+        .field("Owner", format!("{}", mention_user(raid.owner_id) ), true)
+        .field("Description", desc_clean, false)
         .field(
             "Capacity",
             format!("{}/{} (alts allowed: {}, max_alts: {})",
@@ -68,7 +77,7 @@ fn render_raid_embed_inner(ctx_guild: Option<(&Context, u64)>, raid: &Raid, part
             let label = decorate_joined_as(ctx_guild, &p.joined_as);
             let suffix = if p.is_alt { " (ALT)" } else { "" };
             let suffix_role = p.tag_suffix.as_str();
-            rlines.push(format!("• {} <@{}>{}{}", label, p.user_id, suffix,suffix_role));
+            rlines.push(format!("• {} {} {}{}", label, mention_user( p.user_id), suffix,suffix_role));
         }
         if reserves.len() > 10 {
             rlines.push(format!("... and {} more", reserves.len() - 10));

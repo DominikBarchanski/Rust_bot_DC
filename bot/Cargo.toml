@@ -22,7 +22,8 @@ serde_json = "1.0"
 
 # ephemeral state
 dashmap = "5"
-once_cell = "1"
+regex = "1"
+once_cell = "1.19"
 
 # timezone helpers
 chrono-tz = "0.8"

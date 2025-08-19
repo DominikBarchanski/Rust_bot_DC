@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use tokio::time::{sleep_until, Duration, Instant};
+use chrono_tz::Europe::Warsaw;
+use crate::utils::dm_user;
 use serenity::http::Http;
 use serenity::all::ChannelId;
 use sqlx::PgPool;
@@ -56,4 +58,39 @@ async fn promote_and_refresh(
         .edit_message(http, message_id as u64, serenity::builder::EditMessage::new().embed(embed))
         .await?;
     Ok(())
+}
+
+/// Spawn one timer: at (scheduled_for - 15m) DM **current** participants (mains + reserves)
+pub fn schedule_raid_15m_reminder(
+    http: Arc<Http>,
+    pool: PgPool,
+    raid_id: uuid::Uuid,
+    scheduled_for_utc: chrono::DateTime<chrono::Utc>,
+) {
+    let wait = (scheduled_for_utc - chrono::Utc::now()).to_std().unwrap_or(Duration::from_secs(0));
+    let when_inst = Instant::now() + wait;
+
+    tokio::spawn(async move {
+        sleep_until(when_inst).await;
+
+        // Resolve raid + participants at send time (so it's always up-to-date)
+        let raid = match crate::db::repo::get_raid(&pool, raid_id).await {
+            Ok(r) => r, Err(_) => return,
+        };
+        let parts = match crate::db::repo::list_participants(&pool, raid_id).await {
+            Ok(v) => v, Err(_) => return,
+        };
+
+        let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
+        let chan_mention = format!("<#{}>", raid.channel_id as u64);
+
+        for p in parts {
+            let status = if p.is_main { "MAIN" } else { "RESERVE" };
+            let msg = format!(
+                "⏰ Reminder: **{}** starts at **{}**.\nChannel: {}\nYour status: **{}**",
+                raid.raid_name, when_local, chan_mention, status
+            );
+            dm_user(&http, p.user_id as u64, msg).await;
+        }
+    });
 }

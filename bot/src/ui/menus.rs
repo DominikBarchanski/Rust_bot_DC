@@ -25,51 +25,6 @@ pub fn main_buttons_row(raid_id: Uuid) -> CreateActionRow {
     ])
 }
 
-/* Ephemeral class select row */
-pub fn class_menu_row(raid_id: Uuid) -> CreateActionRow {
-    let menu = CreateSelectMenu::new(
-        format!("r:pc:{raid_id}"),
-        CreateSelectMenuKind::String {
-            options: vec![
-                CreateSelectMenuOption::new("MSW", "MSW"),
-                CreateSelectMenuOption::new("MAG", "MAG"),
-                CreateSelectMenuOption::new("ARCH", "ARCH"),
-                CreateSelectMenuOption::new("SWORD", "SWORD"),
-            ],
-        },
-    )
-        .placeholder("Choose your class")
-        .min_values(1)
-        .max_values(1);
-
-    CreateActionRow::SelectMenu(menu)
-}
-
-/* Ephemeral SP select row (dynamic per class) */
-pub fn sp_menu_row(raid_id: Uuid, class: Option<&str>) -> CreateActionRow {
-    let opts = match class.map(|s| s.to_ascii_uppercase()) {
-        Some(ref c) if c == "MSW" => vec![1,2,3,4,9,10,11],
-        _ => (1..=11).collect::<Vec<_>>(),
-    };
-    let options = opts
-        .into_iter()
-        .map(|i| {
-            let name = format!("SP{}", i);
-            CreateSelectMenuOption::new(&name, &name)
-        })
-        .collect::<Vec<_>>();
-
-    let menu = CreateSelectMenu::new(
-        format!("r:ps:{raid_id}"),
-        CreateSelectMenuKind::String { options },
-    )
-        .placeholder("Choose your SP")
-        .min_values(1)
-        .max_values(1);
-
-    CreateActionRow::SelectMenu(menu)
-}
-
 /* Ephemeral confirm/cancel row */
 pub fn confirm_row(raid_id: Uuid, main: bool) -> CreateActionRow {
     CreateActionRow::Buttons(vec![
