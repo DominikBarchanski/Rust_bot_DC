@@ -864,7 +864,7 @@ async fn owner_change_pick(ctx: &Context, it: &ComponentInteraction, raid_id: Uu
         }
         if let Ok(uid64) = sel.parse::<u64>() {
             OWNER_CHANGE.insert((it.user.id.get(), raid_id), uid64);
-            let picked = user_name(ctx, uid64 as i64);
+            let picked = user_name_best(ctx, it.guild_id.map(|g| g.get()), uid64 as i64).await;
             it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
                 CreateInteractionResponseMessage::new()
                     .content(format!("Selected new owner: **{}**. Now click **Transfer ownership**.", picked))
@@ -937,7 +937,7 @@ async fn owner_change_confirm(ctx: &Context, it: &ComponentInteraction, raid_id:
     // Notify both owners
     let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
     let old_owner_u64 = raid.owner_id as u64;
-    let new_owner_name = user_name(ctx, new_owner_u64 as i64);
+    let new_owner_name = user_name_best(ctx, Some(raid.guild_id as u64), new_owner_u64 as i64).await;
 
     dm_user(&ctx.http, new_owner_u64, format!(
         "👑 You are now **owner** of raid **{}** ({}). Channel: <#{}>",
