@@ -3,7 +3,7 @@ use chrono::{NaiveDate, NaiveTime, NaiveDateTime, Utc, TimeZone};
 use chrono::Datelike;
 use crate::handlers::pool_from_ctx;
 use chrono_tz::Europe::Warsaw;
-use serenity::all::{Context, Emoji, UserId,Http,GuildId};
+use serenity::all::{Context, Emoji, UserId,Http,GuildId,RoleId};
 use serenity::prelude::Mentionable;
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
@@ -323,4 +323,25 @@ pub async fn notify_raid_now(ctx: &Context, raid_id: uuid::Uuid) -> anyhow::Resu
         dm_user(&ctx.http, p.user_id as u64, msg).await;
     }
     Ok(())
+}
+
+pub fn parse_list_unique(input: &str) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && seen.insert(s.to_ascii_lowercase()))
+        .map(|s| s.to_string())
+        .collect()
+}
+pub fn role_ids_to_csv(ids: &[RoleId]) -> String {
+    ids.iter().map(|r| r.get().to_string()).collect::<Vec<_>>().join(",")
+}
+
+pub fn csv_to_role_ids(csv: &str) -> Vec<RoleId> {
+    csv.split(',')
+        .filter_map(|p| p.trim().parse::<u64>().ok())
+        .map(RoleId::new)
+        .collect()
 }

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::db::repo;
 use crate::handlers::pool_from_ctx;
 use crate::ui::{embeds, menus};
-use crate::utils::{parse_raid_datetime, weekday_key};
+use crate::utils::{parse_raid_datetime, weekday_key,parse_list_unique,csv_to_role_ids,role_ids_to_csv};
 use crate::tasks;
 use crate::utils::extract_duration_hours;
 use chrono_tz::Europe::Warsaw;
@@ -105,7 +105,7 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
     let mut allow_alts = true;
     let mut max_alts: i64 = 1;
     let mut priority = false;
-    let mut priority_role_name: Option<String> = None;
+    let mut priority_role_name: Vec<String> = Vec::new();
     let mut priority_hours: Option<i64> = None;
     let mut description = String::new();
 
@@ -118,7 +118,7 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
             "max_alts" => if let CommandDataOptionValue::Integer(n) = &opt.value { max_alts = *n; },
             "priority" => if let CommandDataOptionValue::Boolean(b) = &opt.value { priority = *b; },
             "priority_hours" => if let CommandDataOptionValue::Integer(n) = &opt.value { priority_hours = Some(*n); },
-            "prioritylist" => if let CommandDataOptionValue::String(s) = &opt.value { priority_role_name = Some(s.clone()); },
+            "prioritylist" => if let CommandDataOptionValue::String(s) = &opt.value { priority_role_name = parse_list_unique(s); },
             "description" => if let CommandDataOptionValue::String(s) = &opt.value { description = s.clone(); },
             _ => {}
         }
@@ -130,36 +130,86 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
         )).await?;
         return Ok(());
     };
+    let mut priority_role_ids_csv: Option<String> = None; // NEW
 
-    let mut priority_role_id: Option<i64> = None;
+    let mut priority_role_id: Option<Vec<i64>> = None;
     let mut priority_until: Option<chrono::DateTime<chrono::Utc>> = None;
 
     if priority {
-        let role_name = priority_role_name.clone().unwrap_or_else(|| "Maraton".to_string());
+        // default if user didn’t provide any list
+        if priority_role_name.is_empty() {
+            priority_role_name = vec!["Maraton".to_string()];
+        }
+
         if let Some(gid) = cmd.guild_id {
             let roles_map = gid.roles(&ctx.http).await?;
-            let role_id = roles_map
-                .iter()
-                .find_map(|(rid, r)| if r.name.eq_ignore_ascii_case(&role_name) { Some(*rid) } else { None });
-            let Some(role_id) = role_id else {
-                cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new().content(format!("Role `{}` not found.", role_name)).ephemeral(true)
-                )).await?;
-                return Ok(());
-            };
-            let member = gid.member(&ctx.http, cmd.user.id).await?;
-            if !member.roles.contains(&role_id) {
-                cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new().content(format!("You don't have the `{}` role required for priority.", role_name)).ephemeral(true)
-                )).await?;
+
+            // Resolve provided names -> RoleId (case-insensitive)
+            let mut found_role_ids: Vec<RoleId> = Vec::new();
+            for name in &priority_role_name {
+                if let Some((rid, _)) = roles_map
+                    .iter()
+                    .find(|(_, r)| r.name.eq_ignore_ascii_case(name))
+                {
+                    found_role_ids.push(*rid);
+                }
+            }
+
+            if found_role_ids.is_empty() {
+                let listed = priority_role_name.join(", ");
+                cmd.create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!(
+                                "None of the roles from `prioritylist` were found in this server: {}.",
+                                listed
+                            ))
+                            .ephemeral(true),
+                    ),
+                )
+                    .await?;
                 return Ok(());
             }
-            priority_role_id = Some(role_id.get() as i64);
+
+            // Author must have at least one of the matched roles
+            let member = gid.member(&ctx.http, cmd.user.id).await?;
+            let has_any = member.roles.iter().any(|rid| found_role_ids.contains(rid));
+            if !has_any {
+                let listed = priority_role_name.join(", ");
+                cmd.create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!(
+                                "You don't have any of the required roles for priority: {}.",
+                                listed
+                            ))
+                            .ephemeral(true),
+                    ),
+                )
+                    .await?;
+                return Ok(());
+            }
+
+            // === Store as CSV string ===
+            let csv = found_role_ids
+                .iter()
+                .map(|rid| rid.get().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            priority_role_ids_csv = Some(csv);
+
+            // Keep first role id for backward compat (if you still have the old column)
+            let ids_vec_i64: Vec<i64> = found_role_ids.iter().map(|rid| rid.get() as i64).collect();
+            priority_role_id = Some(ids_vec_i64);
+
             if let Some(h) = priority_hours {
                 priority_until = Some(scheduled_for - chrono::Duration::hours(h));
             }
         }
     }
+
 
     let gid = match cmd.guild_id {
         Some(g) => g,

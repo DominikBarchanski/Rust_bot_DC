@@ -6,6 +6,7 @@ use serenity::http::Http;
 use serenity::all::ChannelId;
 use sqlx::PgPool;
 use uuid::Uuid;
+use chrono::Duration as CDuration;
 
 use crate::db::repo;
 
@@ -13,7 +14,7 @@ pub fn schedule_priority_promotion(
     http: Arc<Http>,
     pool: PgPool,
     raid_id: Uuid,
-    _guild_id: i64,
+    guild_id: i64,   // <— use this
     channel_id: i64,
     message_id: i64,
     run_at: chrono::DateTime<chrono::Utc>,
@@ -22,9 +23,10 @@ pub fn schedule_priority_promotion(
     let when = Instant::now() + wait;
     tokio::spawn(async move {
         sleep_until(when).await;
-        let _ = promote_and_refresh(&http, &pool, raid_id, channel_id, message_id).await;
+        let _ = promote_and_refresh(&http, &pool, raid_id, guild_id, channel_id, message_id).await;
     });
 }
+
 
 pub fn schedule_auto_delete(
     http: Arc<Http>,
@@ -44,12 +46,44 @@ async fn promote_and_refresh(
     http: &Http,
     pool: &PgPool,
     raid_id: Uuid,
+    guild_id: i64,
     channel_id: i64,
     message_id: i64,
 ) -> anyhow::Result<()> {
+    use serenity::all::{GuildId, UserId};
     let raid = repo::get_raid(pool, raid_id).await?;
-    let _ = repo::promote_reserves_with_alt_limits(pool, raid_id, raid.max_players, raid.max_alts).await?;
 
+    // Run only AFTER the priority window ended
+    if let Some(until) = raid.priority_until {
+        if chrono::Utc::now() < until {
+            return Ok(()); // too early, skip
+        }
+    }
+
+    // Exclude users who currently have the RESERVE_ROLE_NAME role
+    let mut exclude_ids: Vec<i64> = Vec::new();
+    let gid = GuildId::new(guild_id as u64);
+    if let Ok(roles_map) = gid.roles(http).await {
+        let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
+        let parts_for_check = repo::list_participants(pool, raid_id).await?;
+        for p in &parts_for_check {
+            if let Ok(member) = gid.member(http, UserId::new(p.user_id as u64)).await {
+                let has_reserve = member.roles.iter().any(|rid| {
+                    roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
+                });
+                if has_reserve {
+                    exclude_ids.push(p.user_id);
+                }
+            }
+        }
+    }
+
+    // Promote with exclusions
+    let _ = repo::promote_reserves_with_alt_limits_excluding(
+        pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
+    ).await?;
+
+    // Refresh embed
     let raid = repo::get_raid(pool, raid_id).await?;
     let parts = repo::list_participants(pool, raid_id).await?;
     let embed = crate::ui::embeds::render_raid_embed_plain(&raid, &parts);
@@ -93,4 +127,51 @@ pub fn schedule_raid_15m_reminder(
             dm_user(&http, p.user_id as u64, msg).await;
         }
     });
+}
+
+pub async fn restore_schedules(
+    http: Arc<Http>,
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    // Fetch all active raids we might need to handle
+    let raids = repo::list_active_raids_for_restore(&pool).await?;
+
+    for r in raids {
+        // 3a) Priority promotion at priority_until
+        if let Some(until) = r.priority_until {
+            if chrono::Utc::now() < until {
+                schedule_priority_promotion(
+                    http.clone(), pool.clone(), r.id, r.guild_id, r.channel_id, r.message_id, until
+                );
+            } else {
+                // We missed it while offline → run once now
+                let _ = promote_and_refresh(&http, &pool, r.id, r.guild_id, r.channel_id, r.message_id).await;
+            }
+        }
+
+        // 3b) 15-minute reminder
+        let reminder_at = r.scheduled_for - CDuration::minutes(15);
+        if chrono::Utc::now() < reminder_at {
+            schedule_raid_15m_reminder(http.clone(), pool.clone(), r.id, r.scheduled_for);
+        } else if chrono::Utc::now() < r.scheduled_for {
+            // missed but raid not started yet → send immediately
+            schedule_raid_15m_reminder(http.clone(), pool.clone(), r.id, chrono::Utc::now());
+        }
+
+        // 3c) Auto-delete (recompute from description like at creation)
+        let (_desc_clean, dur_h) = crate::utils::extract_duration_hours(&r.description);
+        let duration_for_schedule: i64 = dur_h.ceil() as i64;
+        let delete_at = r.scheduled_for
+            + CDuration::hours(duration_for_schedule)
+            + CDuration::minutes(20);
+
+        if chrono::Utc::now() < delete_at {
+            schedule_auto_delete(http.clone(), r.id, r.channel_id, delete_at);
+        } else {
+            // If already past, try to delete now (best-effort)
+            let _ = ChannelId::new(r.channel_id as u64).delete(&http).await;
+        }
+    }
+
+    Ok(())
 }

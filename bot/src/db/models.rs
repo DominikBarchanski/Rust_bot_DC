@@ -21,7 +21,7 @@ pub struct Raid {
     pub max_players: i32,
     pub allow_alts: bool,
     pub max_alts: i32,
-    pub priority_role_id: Option<i64>,
+    pub priority_role_id: Option<Vec<i64>>,
     pub priority_until: Option<DateTime<Utc>>,
 }
 

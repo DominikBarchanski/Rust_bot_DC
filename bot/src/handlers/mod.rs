@@ -16,13 +16,24 @@ impl Handler {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
-        if let Err(e) = crate::commands::register_commands(&ctx).await {
-            eprintln!("Failed to register commands: {e}");
-        }
         {
             let mut data = ctx.data.write().await;
             data.insert::<DbKey>(self.pool.clone());
         }
+
+        // (Optional) register slash commands
+        if let Err(e) = crate::commands::register_commands(&ctx).await {
+            eprintln!("Failed to register commands: {e}");
+        }
+
+        // Restore all scheduled jobs after restart (non-blocking)
+        let http = ctx.http.clone();
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::tasks::restore_schedules(http, pool).await {
+                eprintln!("restore_schedules failed: {e:#}");
+            }
+        });
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {

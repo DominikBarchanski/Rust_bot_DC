@@ -1,6 +1,6 @@
 use super::models::{Raid, RaidParticipant};
 use chrono::{DateTime, Utc};
-use sqlx::{types::Json, PgPool};
+use sqlx::{types::Json, PgPool,FromRow};
 use uuid::Uuid;
 use crate::db::repo;
 /* RAIDS */
@@ -21,7 +21,7 @@ pub async fn create_raid_with_id(
     max_players: i32,
     allow_alts: bool,
     max_alts: i32,
-    priority_role_id: Option<i64>,
+    priority_role_id: Option<Vec<i64>>,
     priority_until: Option<DateTime<Utc>>,
 ) -> anyhow::Result<Raid> {
     let raid = sqlx::query_as!(
@@ -41,7 +41,7 @@ pub async fn create_raid_with_id(
         id, guild_id, channel_id, message_id, scheduled_for,
         created_by, owner_id, description, is_priority,
         Json(priority_list) as Json<Vec<i64>>,
-        raid_name, max_players, allow_alts, max_alts, priority_role_id, priority_until
+        raid_name, max_players, allow_alts, max_alts, priority_role_id.as_deref(), priority_until
     )
         .fetch_one(pool)
         .await?;
@@ -102,7 +102,7 @@ pub async fn count_alt_mains(pool: &PgPool, raid_id: Uuid) -> anyhow::Result<i64
 pub async fn user_has_main(pool: &PgPool, raid_id: Uuid, user_id: i64) -> anyhow::Result<bool> {
     let parts: Vec<RaidParticipant> = list_participants(pool, raid_id).await?;
     let has = parts.iter().any(|p| {
-        p.user_id == user_id && p.is_main
+        p.user_id == user_id && ((p.is_main || p.is_reserve) && !p.is_alt)
     });
     Ok(has)
 }
@@ -272,11 +272,100 @@ pub async fn promote_reserves_with_alt_limits(
     Ok(())
 }
 
-// pub async fn user_has_main(pool: &PgPool, raid_id: Uuid, user_id: i64) -> anyhow::Result<bool> {
-//     let parts: Vec<RaidParticipant> = list_participants(pool, raid_id).await?;
-//     let has = parts.iter().any(|p| {
-//         // Adjust field names if they differ in your model
-//         p.user_id == user_id && p.is_main
-//     });
-//     Ok(has)
-// }
+// repo.rs
+pub async fn promote_reserves_with_alt_limits_excluding(
+    pool: &PgPool,
+    raid_id: Uuid,
+    max_players: i32,
+    max_alts: i32,
+    exclude_user_ids: &[i64], // users with "reserve" role — never auto-promote
+) -> anyhow::Result<()> {
+    let mains = super::repo::count_mains(pool, raid_id).await? as i32;
+    let mut free = (max_players - mains).max(0);
+    if free <= 0 { return Ok(()); }
+
+    // 1) Promote non-alt reserves (excluding listed users)
+    let promoted_non_alt = sqlx::query_scalar!(
+        r#"
+        WITH c AS (
+          SELECT id FROM raid_participants
+          WHERE raid_id = $1 AND is_main = FALSE AND is_alt = FALSE
+            AND NOT (user_id = ANY($3::BIGINT[]))
+          ORDER BY joined_at ASC
+          LIMIT $2
+        )
+        UPDATE raid_participants p
+        SET is_main = TRUE, is_reserve = FALSE
+        FROM c
+        WHERE p.id = c.id
+        RETURNING 1
+        "#,
+        raid_id,
+        free as i64,
+        exclude_user_ids
+    )
+        .fetch_all(pool)
+        .await?
+        .len() as i32;
+
+    free -= promoted_non_alt;
+    if free <= 0 { return Ok(()); }
+
+    // 2) Promote alt reserves within alt cap (excluding listed users)
+    let current_alt_mains = super::repo::count_alt_mains(pool, raid_id).await? as i32;
+    let alt_left = (max_alts - current_alt_mains).max(0);
+    if alt_left <= 0 { return Ok(()); }
+
+    let promote_alt = free.min(alt_left);
+    let _promoted_alts = sqlx::query_scalar!(
+        r#"
+        WITH c AS (
+          SELECT id FROM raid_participants
+          WHERE raid_id = $1 AND is_main = FALSE AND is_alt = TRUE
+            AND NOT (user_id = ANY($3::BIGINT[]))
+          ORDER BY joined_at ASC
+          LIMIT $2
+        )
+        UPDATE raid_participants p
+        SET is_main = TRUE, is_reserve = FALSE
+        FROM c
+        WHERE p.id = c.id
+        RETURNING 1
+        "#,
+        raid_id,
+        promote_alt as i64,
+        exclude_user_ids
+    )
+        .fetch_all(pool)
+        .await?
+        .len() as i32;
+
+    Ok(())
+}
+#[derive(Debug, FromRow)]
+pub struct RestoreRaidRow {
+    pub id: Uuid,
+    pub guild_id: i64,
+    pub channel_id: i64,
+    pub message_id: i64,
+    pub scheduled_for: DateTime<Utc>,
+    pub priority_until: Option<DateTime<Utc>>,
+    pub description: String,
+    pub is_active: bool,
+}
+
+pub async fn list_active_raids_for_restore(pool: &PgPool) -> anyhow::Result<Vec<RestoreRaidRow>> {
+    let rows = sqlx::query_as!(
+        RestoreRaidRow,
+        r#"
+        SELECT id, guild_id, channel_id, message_id, scheduled_for,
+               priority_until, description, is_active
+        FROM raids
+        WHERE is_active = TRUE
+        "#
+    )
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
