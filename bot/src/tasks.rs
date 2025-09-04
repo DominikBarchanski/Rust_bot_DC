@@ -152,7 +152,7 @@ pub async fn restore_schedules(
         // 3b) 15-minute reminder
         let reminder_at = r.scheduled_for - CDuration::minutes(15);
         if chrono::Utc::now() < reminder_at {
-            schedule_raid_15m_reminder(http.clone(), pool.clone(), r.id, r.scheduled_for);
+            schedule_raid_15m_reminder(http.clone(), pool.clone(), r.id, reminder_at);
         } else if chrono::Utc::now() < r.scheduled_for {
             // missed but raid not started yet → send immediately
             schedule_raid_15m_reminder(http.clone(), pool.clone(), r.id, chrono::Utc::now());

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::db::repo;
 use crate::handlers::pool_from_ctx;
 use crate::ui::{embeds, menus};
-use crate::utils::{parse_raid_datetime, weekday_key,parse_list_unique,csv_to_role_ids,role_ids_to_csv};
+use crate::utils::{parse_raid_datetime, weekday_key,parse_list_unique};
 use crate::tasks;
 use crate::utils::extract_duration_hours;
 use chrono_tz::Europe::Warsaw;
@@ -130,7 +130,6 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
         )).await?;
         return Ok(());
     };
-    let mut priority_role_ids_csv: Option<String> = None; // NEW
 
     let mut priority_role_id: Option<Vec<i64>> = None;
     let mut priority_until: Option<chrono::DateTime<chrono::Utc>> = None;
@@ -198,7 +197,6 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
                 .map(|rid| rid.get().to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            priority_role_ids_csv = Some(csv);
 
             // Keep first role id for backward compat (if you still have the old column)
             let ids_vec_i64: Vec<i64> = found_role_ids.iter().map(|rid| rid.get() as i64).collect();
