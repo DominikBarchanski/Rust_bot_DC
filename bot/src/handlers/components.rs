@@ -294,8 +294,35 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         None => true,
     };
     if should_try_promote {
-        // (Twoja logika exclude_ids jeśli chcesz — pomijam dla zwięzłości)
-        let _ = repo::promote_reserves_with_alt_limits(&pool, raid_id, raid.max_players, raid.max_alts).await?;
+        // Build exclusion list (users with the "reserve" role)
+        let mut exclude_ids: Vec<i64> = Vec::new();
+        if let Some(gid) = it.guild_id {
+            let roles_map = gid.roles(&ctx.http).await?;
+            let reserve_role_name =
+                std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
+            let parts_for_check = repo::list_participants(&pool, raid_id).await?;
+            for p in &parts_for_check {
+                if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
+                    let has_reserve = member.roles.iter().any(|rid| {
+                        roles_map
+                            .get(rid)
+                            .map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
+                    });
+                    if has_reserve {
+                        exclude_ids.push(p.user_id);
+                    }
+                }
+            }
+        }
+
+        let _ = repo::promote_reserves_with_alt_limits_excluding(
+            &pool,
+            raid_id,
+            raid.max_players,
+            raid.max_alts,
+            &exclude_ids,
+        )
+            .await?;
     }
 
     // Odśwież wiadomość
