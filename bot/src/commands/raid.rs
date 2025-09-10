@@ -22,6 +22,7 @@ pub async fn register(ctx: &Context) -> anyhow::Result<()> {
                     .required(true)
                     .add_string_choice("ArmaV2", "ArmaV2")
                     .add_string_choice("Pollutus", "Pollutus")
+                    .add_string_choice("Sky_Tower", "Sky_Tower")
                     .add_string_choice("Arma", "Arma")
                     .add_string_choice("Azgobas", "Azgobas")
                     .add_string_choice("Valehir", "Valehir")
@@ -59,6 +60,7 @@ fn emoji_and_slug(raid_choice: &str) -> (&'static str, String) {
         "azgobas" => "🐉",
         "valehir" => "💀",
         "alzanor" => "🥶",
+        "sky-tower" => "🗼",
         s if s.starts_with("hc-") => "🔥", // Hc_* variants
         _ => "🏷️", // fallback
     };
