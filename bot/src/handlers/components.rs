@@ -393,7 +393,6 @@ async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> a
         )
         .await?;
 
-    refresh_message(ctx, it, raid_id, "You have been signed out.").await;
     if should_try_promote {
         // zbuduj exclude_ids – użytkownicy z rolą RESERVE
         let mut exclude_ids: Vec<i64> = Vec::new();
@@ -414,6 +413,7 @@ async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> a
             &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
         ).await?;
     }
+    refresh_message(ctx, it, raid_id, "You have been signed out.").await;
     Ok(())
 }
 
@@ -686,10 +686,6 @@ async fn owner_move_to_reserve(ctx: &Context, it: &ComponentInteraction, raid_id
 async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
     let pool = pool_from_ctx(ctx).await?;
     let raid = repo::get_raid(&pool, raid_id).await?;
-    let should_try_promote = match raid.priority_until {
-        Some(until) => chrono::Utc::now() >= until,
-        None => true,
-    };
     if raid.owner_id != it.user.id.get() as i64 { return Ok(()); }
 
     if let ComponentInteractionDataKind::StringSelect { values } = &it.data.kind {
@@ -699,6 +695,27 @@ async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
 
         let _ = repo::remove_participant_by_id(&pool, raid_id, uid).await?;
 
+        let should_try_promote = raid.priority_until.map(|t| chrono::Utc::now() >= t).unwrap_or(true);
+        if should_try_promote {
+            // zbuduj exclude_ids – użytkownicy z rolą RESERVE
+            let mut exclude_ids: Vec<i64> = Vec::new();
+            if let Some(gid) = it.guild_id {
+                let roles_map = gid.roles(&ctx.http).await?;
+                let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
+                let parts_for_check = repo::list_participants(&pool, raid_id).await?;
+                for p in &parts_for_check {
+                    if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
+                        let has_reserve = member.roles.iter().any(|rid| {
+                            roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
+                        });
+                        if has_reserve { exclude_ids.push(p.user_id); }
+                    }
+                }
+            }
+            repo::promote_reserves_global_order_excluding(
+                &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
+            ).await?;
+        }
         let parts = repo::list_participants(&pool, raid_id).await?;
         let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
         ChannelId::new(raid.channel_id as u64)
@@ -707,27 +724,6 @@ async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
         it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new().content("Kicked.")
         )).await?;
-    }
-
-    if should_try_promote {
-        // zbuduj exclude_ids – użytkownicy z rolą RESERVE
-        let mut exclude_ids: Vec<i64> = Vec::new();
-        if let Some(gid) = it.guild_id {
-            let roles_map = gid.roles(&ctx.http).await?;
-            let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
-            let parts_for_check = repo::list_participants(&pool, raid_id).await?;
-            for p in &parts_for_check {
-                if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
-                    let has_reserve = member.roles.iter().any(|rid| {
-                        roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
-                    });
-                    if has_reserve { exclude_ids.push(p.user_id); }
-                }
-            }
-        }
-        let _ = repo::promote_reserves_global_order_excluding(
-            &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
-        ).await?;
     }
     Ok(())
 }

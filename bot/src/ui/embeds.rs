@@ -29,10 +29,10 @@ fn render_raid_embed_inner(ctx_guild: Option<(&Context, u64)>, raid: &Raid, part
     let slots = raid.max_players.max(1) as usize;
 
     let mut mains: Vec<&RaidParticipant> = participants.iter().filter(|p| p.is_main).collect();
-    mains.sort_by_key(|p| (p.is_alt, p.joined_at)); // non-alt mains first
+    // mains.sort_by_key(|p| (p.is_alt, p.joined_at)); // non-alt mains first
 
     let mut reserves: Vec<&RaidParticipant> = participants.iter().filter(|p| !p.is_main).collect();
-    reserves.sort_by_key(|p| (p.is_alt, p.joined_at)); // show non-alt reserves first
+    // reserves.sort_by_key(|p| (p.is_alt, p.joined_at)); // show non-alt reserves first
 
 
     let mut lines: Vec<String> = Vec::with_capacity(slots);
