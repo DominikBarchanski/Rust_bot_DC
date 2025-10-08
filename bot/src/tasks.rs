@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tokio::time::{sleep_until, Duration, Instant};
+use std::collections::HashMap;
 use chrono_tz::Europe::Warsaw;
 use crate::utils::dm_user;
 use serenity::http::Http;
@@ -30,7 +31,8 @@ pub fn schedule_priority_promotion(
 
 pub fn schedule_auto_delete(
     http: Arc<Http>,
-    _raid_id: Uuid,
+    pool: PgPool,                 // <— NOWE
+    _raid_id: Uuid,                // (zostaw jeśli używasz gdzie indziej)
     channel_id: i64,
     run_at: chrono::DateTime<chrono::Utc>,
 ) {
@@ -38,7 +40,9 @@ pub fn schedule_auto_delete(
     let when = Instant::now() + wait;
     tokio::spawn(async move {
         sleep_until(when).await;
-        let _ = ChannelId::new(channel_id as u64).delete(&http).await;
+        if ChannelId::new(channel_id as u64).delete(&http).await.is_ok() {
+            let _ = crate::db::repo::inactive_raid_after_delete_channel(&pool, channel_id).await;
+        }
     });
 }
 
@@ -118,13 +122,22 @@ pub fn schedule_raid_15m_reminder(
         let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
         let chan_mention = format!("<#{}>", raid.channel_id as u64);
 
+        // unique per user: prefer MAIN if they have any main row
+        let mut main_any_by_user: HashMap<i64, bool> = HashMap::new();
         for p in parts {
-            let status = if p.is_main { "MAIN" } else { "RESERVE" };
+            main_any_by_user
+                .entry(p.user_id)
+                .and_modify(|m| *m = *m || p.is_main)
+                .or_insert(p.is_main);
+        }
+
+        for (uid, main_any) in main_any_by_user {
+            let status = if main_any { "MAIN" } else { "RESERVE" };
             let msg = format!(
                 "⏰ Reminder: **{}** starts at **{}**.\nChannel: {}\nYour status: **{}**",
                 raid.raid_name, when_local, chan_mention, status
             );
-            dm_user(&http, p.user_id as u64, msg).await;
+            crate::utils::dm_user(&http, uid as u64, msg).await;
         }
     });
 }
@@ -166,10 +179,10 @@ pub async fn restore_schedules(
             + CDuration::minutes(20);
 
         if chrono::Utc::now() < delete_at {
-            schedule_auto_delete(http.clone(), r.id, r.channel_id, delete_at);
+            schedule_auto_delete(http.clone(),pool.clone(), r.id, r.channel_id, delete_at);
         } else {
-            // If already past, try to delete now (best-effort)
             let _ = ChannelId::new(r.channel_id as u64).delete(&http).await;
+            let _ = crate::db::repo::inactive_raid_after_delete_channel(&pool, r.channel_id).await;
         }
     }
 

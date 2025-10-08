@@ -194,7 +194,7 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
             }
 
             // === Store as CSV string ===
-            let csv = found_role_ids
+            let _csv = found_role_ids
                 .iter()
                 .map(|rid| rid.get().to_string())
                 .collect::<Vec<_>>()
@@ -290,9 +290,10 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
     let duration_for_schedule:i64 = dur_h.ceil() as i64;
     tasks::schedule_auto_delete(
         ctx.http.clone(),
+        pool_from_ctx(ctx).await?,   // <—
         raid_id,
         text_channel.id.get() as i64,
-        scheduled_for + chrono::Duration::hours(duration_for_schedule) +chrono::Duration::minutes(20),
+        scheduled_for + chrono::Duration::hours(duration_for_schedule) + chrono::Duration::minutes(20),
     );
     tasks::schedule_raid_15m_reminder(
         ctx.http.clone(),

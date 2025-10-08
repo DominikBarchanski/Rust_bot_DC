@@ -74,7 +74,7 @@ pub async fn list_participants(pool: &PgPool, raid_id: Uuid) -> anyhow::Result<V
         SELECT id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt, tag_suffix
         FROM raid_participants
         WHERE raid_id = $1
-        ORDER BY is_main DESC, is_alt ASC, joined_at ASC
+        ORDER BY joined_at ASC
         "#,
         raid_id
     )
@@ -368,4 +368,76 @@ pub async fn list_active_raids_for_restore(pool: &PgPool) -> anyhow::Result<Vec<
         .await?;
     Ok(rows)
 }
+pub async fn inactive_raid_after_delete_channel(pool: &PgPool, channel_id: i64) -> anyhow::Result<bool> {
+    let res = sqlx::query!(
+        "UPDATE raids SET is_active = FALSE WHERE channel_id = $1 AND is_active = TRUE",
+        channel_id
+    )
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+pub async fn promote_reserves_global_order_excluding(
+        pool: &PgPool,
+        raid_id: Uuid,
+        max_players: i32,
+        _max_alts: i32,            // limit altów jest per-player, tu nie używamy
+        exclude_user_ids: &[i64],  // osoby z rolą "reserve" – nigdy auto-promocja
+    ) -> anyhow::Result<()> {
+    let mains = count_mains(pool, raid_id).await? as i32;
+        let mut free = (max_players - mains).max(0);
+        if free <= 0 { return Ok(()); }
+
+        let candidates = sqlx::query!(
+            r#"
+        SELECT id, user_id, is_alt
+        FROM raid_participants
+        WHERE raid_id = $1 AND is_main = FALSE
+        ORDER BY joined_at ASC
+        "#,
+            raid_id
+        ).fetch_all(pool).await?;
+
+        for c in candidates {
+            if free <= 0 { break; }
+            if exclude_user_ids.contains(&c.user_id) { continue; }
+
+            if c.is_alt {
+                // ALT może wejść jeśli jest slot (limit per-player egzekwowany przy zapisie)
+                sqlx::query!(
+                    "UPDATE raid_participants SET is_main = TRUE, is_reserve = FALSE WHERE id = $1",
+                    c.id
+                ).execute(pool).await?;
+                free -= 1;
+            } else {
+                // Promote main
+                sqlx::query!(
+                    "UPDATE raid_participants SET is_main = TRUE, is_reserve = FALSE WHERE id = $1",
+                    c.id
+                ).execute(pool).await?;
+                free -= 1;
+
+                // Spróbuj od razu promować najstarszego alta tego samego usera
+                if free > 0 {
+                    if let Some(alt_row) = sqlx::query!(
+                        r#"
+                    SELECT id FROM raid_participants
+                    WHERE raid_id = $1 AND user_id = $2 AND is_main = FALSE AND is_alt = TRUE
+                    ORDER BY joined_at ASC
+                    LIMIT 1
+                    "#,
+                        raid_id, c.user_id
+                    ).fetch_optional(pool).await? {
+                        sqlx::query!(
+                            "UPDATE raid_participants SET is_main = TRUE, is_reserve = FALSE WHERE id = $1",
+                            alt_row.id
+                        ).execute(pool).await?;
+                        free -= 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
 

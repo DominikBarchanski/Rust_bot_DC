@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use std::time::Duration as StdDuration;
 use tokio::time::Instant;
 use regex::Regex;
+use std::collections::HashMap;
 
 pub const ORGANISER_ROLE_NAME: &str = "raid_organiser";
 static NAME_CACHE: Lazy<DashMap<u64, (String, Instant)>> = Lazy::new(DashMap::new);
@@ -308,20 +309,36 @@ pub async fn dm_user(http: &Http, user_id: u64, content: String) {
 
 
 /// Manual “notify now” (owner/organiser-only), same message as the scheduled one
-pub async fn notify_raid_now(ctx: &Context, raid_id: uuid::Uuid) -> anyhow::Result<()> {
+pub async fn notify_raid_now(ctx: &serenity::prelude::Context, raid_id: uuid::Uuid) -> anyhow::Result<()> {
+    use crate::handlers::pool_from_ctx;
+    use crate::db::repo;
+    use chrono_tz::Europe::Warsaw;
+
     let pool = pool_from_ctx(ctx).await?;
-    let raid = crate::db::repo::get_raid(&pool, raid_id).await?;
-    let parts = crate::db::repo::list_participants(&pool, raid_id).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    let parts = repo::list_participants(&pool, raid_id).await?;
+
     let when_local = raid.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M %Z");
     let chan_mention = format!("<#{}>", raid.channel_id as u64);
+
+    // unique per user: prefer MAIN if any main row
+    let mut main_any_by_user: HashMap<i64, bool> = HashMap::new();
     for p in parts {
-        let status = if p.is_main { "MAIN" } else { "RESERVE" };
+        main_any_by_user
+            .entry(p.user_id)
+            .and_modify(|m| *m = *m || p.is_main)
+            .or_insert(p.is_main);
+    }
+
+    for (uid, main_any) in main_any_by_user {
+        let status = if main_any { "MAIN" } else { "RESERVE" };
         let msg = format!(
-            "📣 Notification: **{}** at **{}**.\nChannel: {}\nYour status: **{}**",
+            "📣 Notification: **{}** starts at **{}**.\nChannel: {}\nYour status: **{}**",
             raid.raid_name, when_local, chan_mention, status
         );
-        dm_user(&ctx.http, p.user_id as u64, msg).await;
+        dm_user(&ctx.http, uid as u64, msg).await;
     }
+
     Ok(())
 }
 

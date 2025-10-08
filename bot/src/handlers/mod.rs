@@ -1,6 +1,6 @@
 pub mod components;
 
-use serenity::all::{Context, EventHandler, Interaction, Ready};
+use serenity::all::{Context, EventHandler, Interaction, Ready, GuildChannel, Message};
 use serenity::async_trait;
 use sqlx::PgPool;
 
@@ -52,6 +52,12 @@ impl EventHandler for Handler {
             _ => {}
         }
     }
+    async fn channel_delete(&self, _ctx: Context, channel: GuildChannel, _messages: Option<Vec<Message>>) {
+               if let Err(e) = crate::db::repo::inactive_raid_after_delete_channel(&self.pool, channel.id.get() as i64).await {
+                    eprintln!("inactive_raid_after_delete_channel failed: {e:#}");
+                }
+            }
+
 }
 
 /* Context data access */

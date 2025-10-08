@@ -3,7 +3,7 @@ use crate::handlers::pool_from_ctx;
 use crate::ui::{embeds, menus};
 use crate::utils::{from_user_id, parse_component_id,mention_user,user_name_best,notify_raid_now,dm_user,ORGANISER_ROLE_NAME};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use once_cell::sync::Lazy;
 use chrono::{DateTime,Duration as DD ,Utc};
 use serenity::all::*;
@@ -226,15 +226,14 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     let mut must_reserve = force_reserve;
     if let Some(until) = raid.priority_until {
         if chrono::Utc::now() < until {
-            let has_priority = if let Some(gid) = it.guild_id {
-                let member = gid.member(&ctx.http, it.user.id).await?;
-                let user_roles: std::collections::HashSet<u64> =
-                    member.roles.iter().map(|r| r.get()).collect();
-                match &raid.priority_role_id {
-                    Some(ids) if !ids.is_empty() => ids.iter().any(|id| user_roles.contains(&(*id as u64))),
-                    _ => false,
-                }
-            } else { false };
+                let has_priority = if let Some(gid) = it.guild_id {
+                    let member = gid.member(&ctx.http, it.user.id).await?;
+                    let user_roles: HashSet<u64> = member.roles.iter().map(|r| r.get()).collect();
+                    match &raid.priority_role_id {
+                        Some(ids) if !ids.is_empty() => ids.iter().any(|id| user_roles.contains(&(*id as u64))),
+                        _ => false,
+                    }
+                } else { false };
             if !has_priority { must_reserve = true; }
         }
     }
@@ -278,8 +277,8 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         }
 
         let alt_mains = repo::count_alt_mains(&pool, raid_id).await? as i32;
-        let alt_slots_left = (raid.max_alts - alt_mains).max(0);
-        let can_be_main = free_main > 0 && alt_slots_left > 0 && !must_reserve;
+        let _alt_slots_left = (raid.max_alts - alt_mains).max(0);
+        let can_be_main = free_main > 0 && !must_reserve;
 
         let _ = repo::insert_alt(&pool, raid_id, from_user_id(it.user.id), joined_as, can_be_main, tag_suffix.clone()).await?;
     } else {
@@ -315,15 +314,11 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
             }
         }
 
-        let _ = repo::promote_reserves_with_alt_limits_excluding(
-            &pool,
-            raid_id,
-            raid.max_players,
-            raid.max_alts,
-            &exclude_ids,
-        )
-            .await?;
+        let _ = repo::promote_reserves_global_order_excluding(
+            &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
+        ).await?;
     }
+
 
     // Odśwież wiadomość
     let raid = repo::get_raid(&pool, raid_id).await?;
@@ -350,6 +345,10 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
 async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
     let pool = pool_from_ctx(ctx).await?;
     let raid = repo::get_raid(&pool, raid_id).await?;
+    let should_try_promote = match raid.priority_until {
+        Some(until) => chrono::Utc::now() >= until,
+        None => true,
+    };
     if !raid.is_active {
         it.create_response(&ctx.http, CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
@@ -394,7 +393,28 @@ async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> a
         )
         .await?;
 
-    refresh_message(ctx, it, raid_id, "You have been signed out.").await
+    refresh_message(ctx, it, raid_id, "You have been signed out.").await;
+    if should_try_promote {
+        // zbuduj exclude_ids – użytkownicy z rolą RESERVE
+        let mut exclude_ids: Vec<i64> = Vec::new();
+        if let Some(gid) = it.guild_id {
+            let roles_map = gid.roles(&ctx.http).await?;
+            let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
+            let parts_for_check = repo::list_participants(&pool, raid_id).await?;
+            for p in &parts_for_check {
+                if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
+                    let has_reserve = member.roles.iter().any(|rid| {
+                        roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
+                    });
+                    if has_reserve { exclude_ids.push(p.user_id); }
+                }
+            }
+        }
+        let _ = repo::promote_reserves_global_order_excluding(
+            &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
+        ).await?;
+    }
+    Ok(())
 }
 
 async fn leave_alts(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
@@ -666,6 +686,10 @@ async fn owner_move_to_reserve(ctx: &Context, it: &ComponentInteraction, raid_id
 async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
     let pool = pool_from_ctx(ctx).await?;
     let raid = repo::get_raid(&pool, raid_id).await?;
+    let should_try_promote = match raid.priority_until {
+        Some(until) => chrono::Utc::now() >= until,
+        None => true,
+    };
     if raid.owner_id != it.user.id.get() as i64 { return Ok(()); }
 
     if let ComponentInteractionDataKind::StringSelect { values } = &it.data.kind {
@@ -683,6 +707,27 @@ async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
         it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new().content("Kicked.")
         )).await?;
+    }
+
+    if should_try_promote {
+        // zbuduj exclude_ids – użytkownicy z rolą RESERVE
+        let mut exclude_ids: Vec<i64> = Vec::new();
+        if let Some(gid) = it.guild_id {
+            let roles_map = gid.roles(&ctx.http).await?;
+            let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
+            let parts_for_check = repo::list_participants(&pool, raid_id).await?;
+            for p in &parts_for_check {
+                if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
+                    let has_reserve = member.roles.iter().any(|rid| {
+                        roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
+                    });
+                    if has_reserve { exclude_ids.push(p.user_id); }
+                }
+            }
+        }
+        let _ = repo::promote_reserves_global_order_excluding(
+            &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
+        ).await?;
     }
     Ok(())
 }
