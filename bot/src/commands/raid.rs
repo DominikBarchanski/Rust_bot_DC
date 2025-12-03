@@ -1,5 +1,5 @@
 use serenity::all::*;
-use serenity::builder::{CreateChannel, CreateMessage, EditMessage};
+use serenity::builder::{CreateChannel, CreateMessage, EditMessage, EditInteractionResponse};
 use uuid::Uuid;
 
 use crate::db::repo;
@@ -9,12 +9,13 @@ use crate::utils::{parse_raid_datetime, weekday_key,parse_list_unique, mention_u
 use crate::tasks;
 use crate::utils::extract_duration_hours;
 use chrono_tz::Europe::Warsaw;
+use chrono::Datelike;
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
 
-// In-memory registry of the guild's consolidated raids list message.
-// Key: guild_id, Value: (channel_id, message_id)
-pub static ALL_RAID_LIST_MSG: Lazy<DashMap<u64, (u64, u64)>> = Lazy::new(DashMap::new);
+// In-memory registry of the guild's consolidated raids list messages.
+// Key: guild_id, Value: (channel_id, message_ids[0..=1])
+pub static ALL_RAID_LIST_MSG: Lazy<DashMap<u64, (u64, Vec<u64>)>> = Lazy::new(DashMap::new);
 
 pub async fn register(ctx: &Context) -> anyhow::Result<()> {
     Command::create_global_command(
@@ -143,6 +144,18 @@ pub async fn handle(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<(
 }
 
 async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    // Quick ephemeral ACK to avoid 10s latency errors
+    let _ = cmd
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⏳ Creating raid…")
+                    .ephemeral(true),
+            ),
+        )
+        .await;
+
     let mut raid_name = "arma_v2".to_string();
     let mut raid_date_str = String::new();
     let mut max_players: i64 = 12;
@@ -169,9 +182,9 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
     }
 
     let Some(scheduled_for) = parse_raid_datetime(&raid_date_str) else {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Invalid date format. Use `HH:MM YYYY-MM-DD`.").ephemeral(true)
-        )).await?;
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new()
+            .content("Invalid date format. Use `HH:MM YYYY-MM-DD`.")
+        ).await?;
         return Ok(());
     };
 
@@ -200,18 +213,12 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
 
             if found_role_ids.is_empty() {
                 let listed = priority_role_name.join(", ");
-                cmd.create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content(format!(
-                                "None of the roles from `prioritylist` were found in this server: {}.",
-                                listed
-                            ))
-                            .ephemeral(true),
-                    ),
-                )
-                    .await?;
+                cmd.edit_response(&ctx.http, EditInteractionResponse::new()
+                    .content(format!(
+                        "None of the roles from `prioritylist` were found in this server: {}.",
+                        listed
+                    ))
+                ).await?;
                 return Ok(());
             }
 
@@ -220,18 +227,12 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
             let has_any = member.roles.iter().any(|rid| found_role_ids.contains(rid));
             if !has_any {
                 let listed = priority_role_name.join(", ");
-                cmd.create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content(format!(
-                                "You don't have any of the required roles for priority: {}.",
-                                listed
-                            ))
-                            .ephemeral(true),
-                    ),
-                )
-                    .await?;
+                cmd.edit_response(&ctx.http, EditInteractionResponse::new()
+                    .content(format!(
+                        "You don't have any of the required roles for priority: {}.",
+                        listed
+                    ))
+                ).await?;
                 return Ok(());
             }
 
@@ -256,9 +257,9 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
     let gid = match cmd.guild_id {
         Some(g) => g,
         None => {
-            cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content("Use this in a server.").ephemeral(true)
-            )).await?;
+            cmd.edit_response(&ctx.http, EditInteractionResponse::new()
+                .content("Use this in a server.")
+            ).await?;
             return Ok(());
         }
     };
@@ -347,13 +348,18 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
         scheduled_for - chrono::Duration::minutes(15),
     );
 
-    cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-        CreateInteractionResponseMessage::new().content("Raid created!").ephemeral(true)
-    )).await?;
+    cmd.edit_response(&ctx.http, EditInteractionResponse::new()
+        .content("Raid created!")
+    ).await?;
     Ok(())
 }
 
 async fn handle_kick(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    // Quick ACK to prevent 10s timeout
+    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content("⏳ Processing…").ephemeral(true)
+    )).await;
+
     let mut raid_id_s = String::new();
     let mut user_id: Option<UserId> = None;
     for o in &cmd.data.options {
@@ -365,23 +371,17 @@ async fn handle_kick(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<
     }
 
     let Ok(raid_uuid) = Uuid::parse_str(&raid_id_s) else {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Invalid raid_id").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Invalid raid_id")).await?; return Ok(());
     };
 
     let pool = pool_from_ctx(ctx).await?;
     let raid = repo::get_raid(&pool, raid_uuid).await?;
     if raid.owner_id != cmd.user.id.get() as i64 {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Only the raid owner can kick.").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Only the raid owner can kick.")).await?; return Ok(());
     }
 
     let Some(u) = user_id else {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Missing user.").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Missing user.")).await?; return Ok(());
     };
 
     let _ = repo::remove_participant(&pool, raid_uuid, u.get() as i64).await?;
@@ -395,15 +395,17 @@ async fn handle_kick(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<
                           .components(vec![crate::ui::menus::main_buttons_row(raid_uuid)]))
         .await?;
 
-    cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-        CreateInteractionResponseMessage::new().content("Kicked.").ephemeral(true)
-    )).await?;
+    cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Kicked.")).await?;
     // refresh consolidated list if any
     let _ = refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
     Ok(())
 }
 
 async fn handle_transfer(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    // Quick ACK
+    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content("⏳ Processing…").ephemeral(true)
+    )).await;
     let mut raid_s = String::new();
     let mut new_owner: Option<UserId> = None;
     for o in &cmd.data.options {
@@ -414,26 +416,24 @@ async fn handle_transfer(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Res
         }
     }
     let Ok(raid_id) = Uuid::parse_str(&raid_s) else {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Invalid raid_id").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Invalid raid_id")).await?; return Ok(());
     };
     let pool = pool_from_ctx(ctx).await?;
     let raid = repo::get_raid(&pool, raid_id).await?;
     if raid.owner_id != cmd.user.id.get() as i64 {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Only current owner can transfer.").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Only current owner can transfer.")).await?; return Ok(());
     }
     let Some(new_owner) = new_owner else { return Ok(()); };
     sqlx::query!("UPDATE raids SET owner_id = $1 WHERE id = $2", new_owner.get() as i64, raid_id)
         .execute(&pool).await?;
-    cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-        CreateInteractionResponseMessage::new().content("Ownership transferred.").ephemeral(true)
-    )).await?;
+    cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Ownership transferred.")).await?;
     Ok(())
 }
 async fn handle_role_add(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    // Quick ACK
+    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content("⏳ Processing…").ephemeral(true)
+    )).await;
     // Parse options
     let mut target_user: Option<UserId> = None;
     let mut action: String = String::new();
@@ -448,15 +448,11 @@ async fn handle_role_add(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Res
     }
 
     let Some(gid) = cmd.guild_id else {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Use this in a server.").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Use this in a server.")).await?; return Ok(());
     };
 
     let Some(user_id) = target_user else {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Missing user.").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Missing user.")).await?; return Ok(());
     };
 
     // Permission: must have raid_organiser role
@@ -466,9 +462,7 @@ async fn handle_role_add(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Res
         roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(ORGANISER_ROLE_NAME))
     });
     if !is_organiser {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Only raid_organiser can use this.").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Only raid_organiser can use this.")).await?; return Ok(());
     }
 
     // Resolve actual role name (reserve can be overridden by env)
@@ -480,41 +474,33 @@ async fn handle_role_add(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Res
 
     let role_id = roles_map.iter().find_map(|(rid, r)| if r.name.eq_ignore_ascii_case(&wanted_name) { Some(*rid) } else { None });
     let Some(role_id) = role_id else {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content(format!("Role '{}' not found on this server.", wanted_name)).ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content(format!("Role '{}' not found on this server.", wanted_name))).await?; return Ok(());
     };
 
-    let mut member = gid.member(&ctx.http, user_id).await?;
+    let member = gid.member(&ctx.http, user_id).await?;
     let res = if action.eq_ignore_ascii_case("add") {
         member.add_role(&ctx.http, role_id).await
     } else if action.eq_ignore_ascii_case("remove") {
         member.remove_role(&ctx.http, role_id).await
     } else {
-        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content("Action must be 'add' or 'remove'.").ephemeral(true)
-        )).await?; return Ok(());
+        cmd.edit_response(&ctx.http, EditInteractionResponse::new().content("Action must be 'add' or 'remove'.")).await?; return Ok(());
     };
 
     match res {
         Ok(_) => {
-            cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(format!(
-                        "{} role '{}' for {}.",
-                        if action.eq_ignore_ascii_case("add") { "Added" } else { "Removed" },
-                        wanted_name,
-                        mention_user(user_id.get() as i64)
-                    ))
-                    .ephemeral(true)
-            )).await?;
+            cmd.edit_response(&ctx.http, EditInteractionResponse::new()
+                .content(format!(
+                    "{} role '{}' for {}.",
+                    if action.eq_ignore_ascii_case("add") { "Added" } else { "Removed" },
+                    wanted_name,
+                    mention_user(user_id.get() as i64)
+                ))
+            ).await?;
         }
         Err(e) => {
-            cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(format!("Failed to {} role: {}", action, e))
-                    .ephemeral(true)
-            )).await?;
+            cmd.edit_response(&ctx.http, EditInteractionResponse::new()
+                .content(format!("Failed to {} role: {}", action, e))
+            ).await?;
         }
     }
     Ok(())
@@ -522,45 +508,202 @@ async fn handle_role_add(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Res
 
 async fn handle_all_raid_list(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
     let Some(gid) = cmd.guild_id else { return Ok(()); };
+
+    // Quick ephemeral ACK to avoid 10s latency errors
+    let _ = cmd
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⏳ Generating the raids list…")
+                    .ephemeral(true),
+            ),
+        )
+        .await;
+
     let pool = pool_from_ctx(ctx).await?;
-    let list_text = render_all_raids_list(ctx, &pool, gid.get()).await?;
+    let chunks = render_all_raids_list(ctx, &pool, gid.get()).await?;
 
-    // Send a new message in the invoking channel and store mapping
-    let msg = cmd.channel_id.send_message(&ctx.http, CreateMessage::new().content(list_text)).await?;
-    ALL_RAID_LIST_MSG.insert(gid.get(), (cmd.channel_id.get(), msg.id.get()));
+    // Send one or two messages in the invoking channel and store mapping
+    let mut ids: Vec<u64> = Vec::new();
+    for c in &chunks {
+        let m = cmd
+            .channel_id
+            .send_message(&ctx.http, CreateMessage::new().content(c.clone()))
+            .await?;
+        ids.push(m.id.get());
+    }
+    ALL_RAID_LIST_MSG.insert(gid.get(), (cmd.channel_id.get(), ids));
 
-    // Best-effort ephemeral ack as well (optional)
-    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-        CreateInteractionResponseMessage::new().content("Posted/updated the raids list in this channel.").ephemeral(true)
-    )).await;
+    // Finalize the ephemeral response
+    let _ = cmd
+        .edit_response(
+            &ctx.http,
+            EditInteractionResponse::new()
+                .content("Posted/updated the raids list in this channel."),
+        )
+        .await;
 
     Ok(())
 }
 
-async fn render_all_raids_list(ctx: &Context, pool: &sqlx::PgPool, guild_id: u64) -> anyhow::Result<String> {
+fn day_labels() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("Mon", "Poniedziałek", "Monday"),
+        ("Tue", "Wtorek", "Tuesday"),
+        ("Wed", "Środa", "Wednesday"),
+        ("Thu", "Czwartek", "Thursday"),
+        ("Fri", "Piątek", "Friday"),
+        ("Sat", "Sobota", "Saturday"),
+        ("Sun", "Niedziela", "Sunday"),
+    ]
+}
+
+async fn render_all_raids_list(_ctx: &Context, pool: &sqlx::PgPool, guild_id: u64) -> anyhow::Result<Vec<String>> {
     let rows = repo::list_active_raids_by_guild(pool, guild_id as i64).await?;
     if rows.is_empty() {
-        return Ok("Brak aktywnych rajdów.".to_string());
+        return Ok(vec!["Brak aktywnych rajdów.".to_string()]);
     }
-    let mut out = String::from("Aktualne rajdy:\n");
+
+    // Group raids by weekday in Warsaw timezone
+    let mut by_day: [Vec<String>; 7] = Default::default();
     for r in rows {
+        let when_local = r.scheduled_for.with_timezone(&Warsaw);
+        let weekday = when_local.weekday();
+        let idx = match weekday {
+            chrono::Weekday::Mon => 0,
+            chrono::Weekday::Tue => 1,
+            chrono::Weekday::Wed => 2,
+            chrono::Weekday::Thu => 3,
+            chrono::Weekday::Fri => 4,
+            chrono::Weekday::Sat => 5,
+            chrono::Weekday::Sun => 6,
+        };
         let filled = repo::count_mains(pool, r.id).await.unwrap_or(0);
         let chan_tag = format!("<#{}>", r.channel_id as u64);
-        let owner = mention_user(r.created_by);
-        let when_local = r.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M");
-        out.push_str(&format!("• {} — {} — {}/{} — {} — {}\n", r.raid_name, owner, filled, r.max_players, when_local, chan_tag));
+        // No owner, no time — just name, count and channel
+        by_day[idx].push(format!("• {} — {}/{} — {}", r.raid_name, filled, r.max_players, chan_tag));
     }
-    Ok(out)
+
+    // Build full template with bilingual headers and footers
+    let mut sections: Vec<String> = Vec::new();
+    let header = "# :flag_pl: Rajdy na następny tydzień zostały rozpisane.\n# :flag_gb: Raids for next week have been organised.\n\n";
+    sections.push(header.to_string());
+
+    let labels = day_labels();
+    for (i, (_abbr, pl, en)) in labels.iter().enumerate() {
+        let mut s = String::new();
+        s.push_str(&format!("**{} - {} **\n", pl, en));
+        if by_day[i].is_empty() {
+            // leave empty (no #bramki placeholder)
+        } else {
+            s.push_str(&by_day[i].join("\n"));
+            s.push('\n');
+        }
+        s.push('\n');
+        sections.push(s);
+    }
+
+    let footer = "**Niektóre rajdy mogą zostać dopisane w późniejszym terminie.**\n**Some raids may be added at a later date.**\n";
+    sections.push(footer.to_string());
+
+    // Split into up to two messages under 2000 chars
+    const LIM: usize = 1900; // safety margin below 2000
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for sec in sections {
+        if cur.len() + sec.len() <= LIM {
+            cur.push_str(&sec);
+        } else {
+            if cur.is_empty() {
+                // section alone too big: hard-truncate
+                let mut truncated = sec.chars().take(LIM - 1).collect::<String>();
+                truncated.push('\n');
+                chunks.push(truncated);
+            } else {
+                chunks.push(cur);
+                cur = String::new();
+                cur.push_str(&sec);
+            }
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+
+    if chunks.len() > 2 {
+        // Keep only two; merge the tail into the second with truncation
+        let mut second = String::new();
+        for ch in chunks.iter().skip(1) {
+            if second.len() + ch.len() <= LIM {
+                second.push_str(ch);
+            } else {
+                let space = LIM.saturating_sub(second.len());
+                if space > 4 {
+                    let mut part = ch.chars().take(space - 4).collect::<String>();
+                    part.push_str("\n…");
+                    second.push_str(&part);
+                }
+                break;
+            }
+        }
+        return Ok(vec![chunks[0].clone(), second]);
+    }
+
+    Ok(chunks)
 }
 
 pub async fn refresh_guild_raid_list_if_any(ctx: &Context, guild_id: u64) -> anyhow::Result<()> {
-    if let Some(entry) = ALL_RAID_LIST_MSG.get(&guild_id) {
-        let (chan_id, msg_id) = *entry.value();
+    if let Some(mut entry) = ALL_RAID_LIST_MSG.get_mut(&guild_id) {
+        let (chan_id, ref mut msg_ids) = *entry.value_mut();
         let pool = pool_from_ctx(ctx).await?;
-        let content = render_all_raids_list(ctx, &pool, guild_id).await?;
-        let _ = ChannelId::new(chan_id)
-            .edit_message(&ctx.http, msg_id, EditMessage::new().content(content))
-            .await;
+        let chunks = render_all_raids_list(ctx, &pool, guild_id).await?;
+        let channel = ChannelId::new(chan_id);
+
+        match (msg_ids.len(), chunks.len()) {
+            (1, 1) => {
+                let _ = channel
+                    .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
+                    .await;
+            }
+            (1, 2) => {
+                let _ = channel
+                    .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
+                    .await;
+                let m = channel
+                    .send_message(&ctx.http, CreateMessage::new().content(chunks[1].clone()))
+                    .await?;
+                msg_ids.push(m.id.get());
+            }
+            (2, 1) => {
+                let _ = channel
+                    .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
+                    .await;
+                let _ = channel.delete_message(&ctx.http, msg_ids[1]).await;
+                msg_ids.truncate(1);
+            }
+            (2, 2) => {
+                let _ = channel
+                    .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
+                    .await;
+                let _ = channel
+                    .edit_message(&ctx.http, msg_ids[1], EditMessage::new().content(chunks[1].clone()))
+                    .await;
+            }
+            _ => {
+                // Any other case -> recreate fresh
+                for mid in msg_ids.iter() {
+                    let _ = channel.delete_message(&ctx.http, *mid).await;
+                }
+                msg_ids.clear();
+                for c in chunks {
+                    let m = channel
+                        .send_message(&ctx.http, CreateMessage::new().content(c))
+                        .await?;
+                    msg_ids.push(m.id.get());
+                }
+            }
+        }
     }
     Ok(())
 }

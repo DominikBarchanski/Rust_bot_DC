@@ -416,7 +416,7 @@ async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> a
             &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
         ).await?;
     }
-    refresh_message(ctx, it, raid_id, "You have been signed out.").await;
+    let _ =refresh_message(ctx, it, raid_id, "You have been signed out.").await;
     Ok(())
 }
 

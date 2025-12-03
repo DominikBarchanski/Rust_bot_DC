@@ -2,7 +2,6 @@ use std::sync::Arc;
 use tokio::time::{sleep_until, Duration, Instant};
 use std::collections::HashMap;
 use chrono_tz::Europe::Warsaw;
-use crate::utils::dm_user;
 use serenity::http::Http;
 use serenity::all::ChannelId;
 use sqlx::PgPool;

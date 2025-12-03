@@ -1,7 +1,6 @@
 use uuid::Uuid;
 use chrono::{NaiveDate, NaiveTime, NaiveDateTime, Utc, TimeZone};
 use chrono::Datelike;
-use crate::handlers::pool_from_ctx;
 use chrono_tz::Europe::Warsaw;
 use serenity::all::{Context, Emoji, UserId,Http,GuildId,RoleId};
 use serenity::prelude::Mentionable;
