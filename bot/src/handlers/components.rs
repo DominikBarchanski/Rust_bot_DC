@@ -338,6 +338,9 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     sleep(Duration::from_secs(5)).await;
     let _ = it.delete_response(&ctx.http).await;
 
+    // also try to refresh guild list (if any was created via /all_raid_list)
+    let _ = crate::commands::raid::refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
+
     JOIN_STATE.remove(&key);
     Ok(())
 }
@@ -441,9 +444,11 @@ async fn refresh_message(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid
         .edit_message(&ctx.http, raid.message_id as u64,
                       EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)]))
         .await?;
-    it.create_response(&ctx.http, CreateInteractionResponse::Message(
-        CreateInteractionResponseMessage::new().content(tip).ephemeral(true)
-    )).await?;
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(tip).ephemeral(true)
+        )).await?;
+    // refresh guild list if any
+    let _ = crate::commands::raid::refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
     Ok(())
 }
 
@@ -721,6 +726,8 @@ async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
         ChannelId::new(raid.channel_id as u64)
             .edit_message(&ctx.http, raid.message_id as u64,
                           EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)])).await?;
+        // refresh consolidated list if any
+        let _ = crate::commands::raid::refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
         it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new().content("Kicked.")
         )).await?;
@@ -762,6 +769,8 @@ async fn owner_cancel(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
         CreateInteractionResponseMessage::new().content("Raid cancelled. Channel will delete in ~2h.")
     )).await?;
+    // refresh consolidated list if any
+    let _ = crate::commands::raid::refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
     Ok(())
 }
 async fn close_ephemeral(ctx: &Context, it: &ComponentInteraction) -> anyhow::Result<()> {

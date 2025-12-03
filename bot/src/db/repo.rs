@@ -440,4 +440,36 @@ pub async fn promote_reserves_global_order_excluding(
         Ok(())
     }
 
+#[derive(Debug, FromRow, Clone)]
+pub struct GuildRaidListRow {
+    pub id: Uuid,
+    pub guild_id: i64,
+    pub channel_id: i64,
+    pub message_id: i64,
+    pub scheduled_for: DateTime<Utc>,
+    pub created_by: i64,
+    pub owner_id: i64,
+    pub raid_name: String,
+    pub max_players: i32,
+    pub allow_alts: bool,
+    pub max_alts: i32,
+}
+
+pub async fn list_active_raids_by_guild(pool: &PgPool, guild_id: i64) -> anyhow::Result<Vec<GuildRaidListRow>> {
+    let rows = sqlx::query_as!(
+        GuildRaidListRow,
+        r#"
+        SELECT id, guild_id, channel_id, message_id, scheduled_for,
+               created_by, owner_id, raid_name, max_players, allow_alts, max_alts
+        FROM raids
+        WHERE is_active = TRUE AND guild_id = $1
+        ORDER BY scheduled_for ASC
+        "#,
+        guild_id
+    )
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
 

@@ -1,14 +1,20 @@
 use serenity::all::*;
-use serenity::builder::{CreateChannel, CreateMessage};
+use serenity::builder::{CreateChannel, CreateMessage, EditMessage};
 use uuid::Uuid;
 
 use crate::db::repo;
 use crate::handlers::pool_from_ctx;
 use crate::ui::{embeds, menus};
-use crate::utils::{parse_raid_datetime, weekday_key,parse_list_unique};
+use crate::utils::{parse_raid_datetime, weekday_key,parse_list_unique, mention_user, ORGANISER_ROLE_NAME};
 use crate::tasks;
 use crate::utils::extract_duration_hours;
 use chrono_tz::Europe::Warsaw;
+use once_cell::sync::Lazy;
+use dashmap::DashMap;
+
+// In-memory registry of the guild's consolidated raids list message.
+// Key: guild_id, Value: (channel_id, message_id)
+pub static ALL_RAID_LIST_MSG: Lazy<DashMap<u64, (u64, u64)>> = Lazy::new(DashMap::new);
 
 pub async fn register(ctx: &Context) -> anyhow::Result<()> {
     Command::create_global_command(
@@ -91,11 +97,47 @@ pub async fn register_transfer(ctx: &Context) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn register_role_add(ctx: &Context) -> anyhow::Result<()> {
+    Command::create_global_command(
+        &ctx.http,
+        CreateCommand::new("role_add")
+            .description("Add or remove a predefined role to a user (raid_organiser only)")
+            .add_option(CreateCommandOption::new(CommandOptionType::User, "user", "Target user").required(true))
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "action", "add or remove")
+                    .required(true)
+                    .add_string_choice("add", "add")
+                    .add_string_choice("remove", "remove")
+            )
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "role", "Role to set")
+                    .required(true)
+                    .add_string_choice("Maraton", "Maraton")
+                    .add_string_choice("c90", "c90")
+                    .add_string_choice("c1-89", "c1-89")
+                    .add_string_choice("Alt_allow", "Alt_allow")
+                    .add_string_choice("reserve", "reserve")
+            )
+    ).await?;
+    Ok(())
+}
+
+pub async fn register_all_raid_list(ctx: &Context) -> anyhow::Result<()> {
+    Command::create_global_command(
+        &ctx.http,
+        CreateCommand::new("all_raid_list")
+            .description("Post a consolidated, auto-updating list of active raids in this channel")
+    ).await?;
+    Ok(())
+}
+
 pub async fn handle(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
     match cmd.data.name.as_str() {
         "raid" => handle_create(ctx, cmd).await,
         "raid_kick" => handle_kick(ctx, cmd).await,
         "raid_transfer" => handle_transfer(ctx, cmd).await,
+        "role_add" => handle_role_add(ctx, cmd).await,
+        "all_raid_list" => handle_all_raid_list(ctx, cmd).await,
         _ => Ok(())
     }
 }
@@ -287,6 +329,9 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
             until,
         );
     }
+
+    // Try refresh consolidated list (if exists in this guild)
+    let _ = refresh_guild_raid_list_if_any(ctx, gid.get()).await;
     let duration_for_schedule:i64 = dur_h.ceil() as i64;
     tasks::schedule_auto_delete(
         ctx.http.clone(),
@@ -353,6 +398,8 @@ async fn handle_kick(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<
     cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new().content("Kicked.").ephemeral(true)
     )).await?;
+    // refresh consolidated list if any
+    let _ = refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
     Ok(())
 }
 
@@ -384,5 +431,136 @@ async fn handle_transfer(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Res
     cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new().content("Ownership transferred.").ephemeral(true)
     )).await?;
+    Ok(())
+}
+async fn handle_role_add(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    // Parse options
+    let mut target_user: Option<UserId> = None;
+    let mut action: String = String::new();
+    let mut role_choice: String = String::new();
+    for o in &cmd.data.options {
+        match o.name.as_str() {
+            "user" => if let CommandDataOptionValue::User(u) = &o.value { target_user = Some(*u); },
+            "action" => if let CommandDataOptionValue::String(s) = &o.value { action = s.clone(); },
+            "role" => if let CommandDataOptionValue::String(s) = &o.value { role_choice = s.clone(); },
+            _ => {}
+        }
+    }
+
+    let Some(gid) = cmd.guild_id else {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Use this in a server.").ephemeral(true)
+        )).await?; return Ok(());
+    };
+
+    let Some(user_id) = target_user else {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Missing user.").ephemeral(true)
+        )).await?; return Ok(());
+    };
+
+    // Permission: must have raid_organiser role
+    let roles_map = gid.roles(&ctx.http).await?;
+    let invoker = gid.member(&ctx.http, cmd.user.id).await?;
+    let is_organiser = invoker.roles.iter().any(|rid| {
+        roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(ORGANISER_ROLE_NAME))
+    });
+    if !is_organiser {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Only raid_organiser can use this.").ephemeral(true)
+        )).await?; return Ok(());
+    }
+
+    // Resolve actual role name (reserve can be overridden by env)
+    let wanted_name = if role_choice.eq_ignore_ascii_case("reserve") {
+        std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string())
+    } else {
+        role_choice.clone()
+    };
+
+    let role_id = roles_map.iter().find_map(|(rid, r)| if r.name.eq_ignore_ascii_case(&wanted_name) { Some(*rid) } else { None });
+    let Some(role_id) = role_id else {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(format!("Role '{}' not found on this server.", wanted_name)).ephemeral(true)
+        )).await?; return Ok(());
+    };
+
+    let mut member = gid.member(&ctx.http, user_id).await?;
+    let res = if action.eq_ignore_ascii_case("add") {
+        member.add_role(&ctx.http, role_id).await
+    } else if action.eq_ignore_ascii_case("remove") {
+        member.remove_role(&ctx.http, role_id).await
+    } else {
+        cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("Action must be 'add' or 'remove'.").ephemeral(true)
+        )).await?; return Ok(());
+    };
+
+    match res {
+        Ok(_) => {
+            cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!(
+                        "{} role '{}' for {}.",
+                        if action.eq_ignore_ascii_case("add") { "Added" } else { "Removed" },
+                        wanted_name,
+                        mention_user(user_id.get() as i64)
+                    ))
+                    .ephemeral(true)
+            )).await?;
+        }
+        Err(e) => {
+            cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!("Failed to {} role: {}", action, e))
+                    .ephemeral(true)
+            )).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_all_raid_list(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    let Some(gid) = cmd.guild_id else { return Ok(()); };
+    let pool = pool_from_ctx(ctx).await?;
+    let list_text = render_all_raids_list(ctx, &pool, gid.get()).await?;
+
+    // Send a new message in the invoking channel and store mapping
+    let msg = cmd.channel_id.send_message(&ctx.http, CreateMessage::new().content(list_text)).await?;
+    ALL_RAID_LIST_MSG.insert(gid.get(), (cmd.channel_id.get(), msg.id.get()));
+
+    // Best-effort ephemeral ack as well (optional)
+    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content("Posted/updated the raids list in this channel.").ephemeral(true)
+    )).await;
+
+    Ok(())
+}
+
+async fn render_all_raids_list(ctx: &Context, pool: &sqlx::PgPool, guild_id: u64) -> anyhow::Result<String> {
+    let rows = repo::list_active_raids_by_guild(pool, guild_id as i64).await?;
+    if rows.is_empty() {
+        return Ok("Brak aktywnych rajdów.".to_string());
+    }
+    let mut out = String::from("Aktualne rajdy:\n");
+    for r in rows {
+        let filled = repo::count_mains(pool, r.id).await.unwrap_or(0);
+        let chan_tag = format!("<#{}>", r.channel_id as u64);
+        let owner = mention_user(r.created_by);
+        let when_local = r.scheduled_for.with_timezone(&Warsaw).format("%Y-%m-%d %H:%M");
+        out.push_str(&format!("• {} — {} — {}/{} — {} — {}\n", r.raid_name, owner, filled, r.max_players, when_local, chan_tag));
+    }
+    Ok(out)
+}
+
+pub async fn refresh_guild_raid_list_if_any(ctx: &Context, guild_id: u64) -> anyhow::Result<()> {
+    if let Some(entry) = ALL_RAID_LIST_MSG.get(&guild_id) {
+        let (chan_id, msg_id) = *entry.value();
+        let pool = pool_from_ctx(ctx).await?;
+        let content = render_all_raids_list(ctx, &pool, guild_id).await?;
+        let _ = ChannelId::new(chan_id)
+            .edit_message(&ctx.http, msg_id, EditMessage::new().content(content))
+            .await;
+    }
     Ok(())
 }
