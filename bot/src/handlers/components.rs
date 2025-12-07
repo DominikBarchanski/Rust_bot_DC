@@ -1,5 +1,6 @@
 use crate::db::repo;
-use crate::handlers::pool_from_ctx;
+use crate::handlers::{pool_from_ctx, redis_from_ctx};
+use crate::queue;
 use crate::ui::{embeds, menus};
 use crate::utils::{from_user_id, parse_component_id,mention_user,user_name_best,notify_raid_now,dm_user,ORGANISER_ROLE_NAME};
 use dashmap::DashMap;
@@ -275,53 +276,26 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
             ).await?;
             return Ok(());
         }
-
-        let alt_mains = repo::count_alt_mains(&pool, raid_id).await? as i32;
-        let _alt_slots_left = (raid.max_alts - alt_mains).max(0);
-        let can_be_main = free_main > 0 && !must_reserve;
-
-        let _ = repo::insert_alt(&pool, raid_id, from_user_id(it.user.id), joined_as, can_be_main, tag_suffix.clone()).await?;
-    } else {
-        let can_be_main = free_main > 0 && !must_reserve;
-        let _ = repo::insert_or_replace_main(&pool, raid_id, from_user_id(it.user.id), joined_as, can_be_main, tag_suffix.clone()).await?;
     }
 
-    // Po oknie: spróbuj promować
-    let raid = repo::get_raid(&pool, raid_id).await?;
-    let should_try_promote = match raid.priority_until {
-        Some(until) => chrono::Utc::now() >= until,
-        None => true,
+    // Publish to Redis queue and wait briefly for ACK
+    let can_be_main = free_main > 0 && !must_reserve;
+    let redis = redis_from_ctx(ctx).await?;
+    let ev = queue::RaidEvent::Join {
+        raid_id,
+        guild_id: raid.guild_id,
+        user_id: from_user_id(it.user.id),
+        joined_as,
+        main_now: can_be_main,
+        tag_suffix: tag_suffix.clone(),
+        is_alt: is_alt_join,
     };
-    if should_try_promote {
-        // Build exclusion list (users with the "reserve" role)
-        let mut exclude_ids: Vec<i64> = Vec::new();
-        if let Some(gid) = it.guild_id {
-            let roles_map = gid.roles(&ctx.http).await?;
-            let reserve_role_name =
-                std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
-            let parts_for_check = repo::list_participants(&pool, raid_id).await?;
-            for p in &parts_for_check {
-                if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
-                    let has_reserve = member.roles.iter().any(|rid| {
-                        roles_map
-                            .get(rid)
-                            .map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
-                    });
-                    if has_reserve {
-                        exclude_ids.push(p.user_id);
-                    }
-                }
-            }
-        }
-
-        let _ = repo::promote_reserves_global_order_excluding(
-            &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
-        ).await?;
-    }
+    let corr = queue::publish(&redis, &ev).await?;
+    let _ack = queue::wait_for_ack(&redis, &corr, 900).await?; // best-effort
 
 
     // Odśwież wiadomość
-    let raid = repo::get_raid(&pool, raid_id).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?; // re-read after ack
     let parts = repo::list_participants(&pool, raid_id).await?;
     let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
     ChannelId::new(raid.channel_id as u64)
@@ -348,10 +322,6 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
 async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
     let pool = pool_from_ctx(ctx).await?;
     let raid = repo::get_raid(&pool, raid_id).await?;
-    let should_try_promote = match raid.priority_until {
-        Some(until) => chrono::Utc::now() >= until,
-        None => true,
-    };
     if !raid.is_active {
         it.create_response(&ctx.http, CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
@@ -360,63 +330,48 @@ async fn leave_all(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> a
         )).await?;
         return Ok(());
     }
-    let removed_main = repo::remove_participant(&pool, raid_id, from_user_id(it.user.id)).await?;
+
+    // Publish to queue
+    let redis = redis_from_ctx(ctx).await?;
     let user_id = from_user_id(it.user.id);
-    let removed_alts = repo::remove_user_alts(&pool, raid_id, user_id).await?;
+    let ev = queue::RaidEvent::LeaveAll { raid_id, guild_id: raid.guild_id, user_id };
+    let corr = queue::publish(&redis, &ev).await?;
+    let ack = queue::wait_for_ack(&redis, &corr, 900).await?;
+
+    // Re-read raid and refresh UI; notify if something actually removed
     let raid = repo::get_raid(&pool, raid_id).await?;
     let time_left = human_time_left(raid.scheduled_for);
-    let owner_id = UserId::new(raid.owner_id as u64);
-    let dm = owner_id.create_dm_channel(&ctx.http).await?;
-    if removed_main == 0 && removed_alts == 0 {
-        // Already signed out — don't notify owner/channel again
-        return refresh_message(ctx, it, raid_id, "You were already signed out.").await;
+    let removed_any = ack.as_ref().map(|a| a.removed_main.unwrap_or(0) + a.removed_alts.unwrap_or(0) > 0).unwrap_or(true);
+    if removed_any {
+        let owner_id = UserId::new(raid.owner_id as u64);
+        let dm = owner_id.create_dm_channel(&ctx.http).await?;
+        dm.id
+            .send_message(
+                &ctx.http,
+                CreateMessage::new().content(format!(
+                    "Heads up: user {user} signed off from raid \"{name}\".\nChannel: <#{chan}>\nStarts in: {left}",
+                    user = mention_user(user_id),
+                    name = raid.raid_name,
+                    chan = raid.channel_id as u64,
+                    left = time_left
+                )),
+            )
+            .await?;
+
+        ChannelId::new(raid.channel_id as u64)
+            .send_message(
+                &ctx.http,
+                CreateMessage::new().content(format!(
+                    "<@{user}> signed off. Raid starts in {left}.",
+                    user = user_id,
+                    left = time_left
+                )),
+            )
+            .await?;
+        let _ = refresh_message(ctx, it, raid_id, "You have been signed out.").await;
+    } else {
+        let _ = refresh_message(ctx, it, raid_id, "You were already signed out.").await;
     }
-
-    dm.id
-        .send_message(
-            &ctx.http,
-            CreateMessage::new().content(format!(
-                "Heads up: user {user} signed off from raid \"{name}\".\nChannel: <#{chan}>\nStarts in: {left}",
-                user = mention_user(user_id),
-                name = raid.raid_name,
-                chan = raid.channel_id as u64,
-                left = time_left
-            )),
-        )
-        .await?;
-
-    ChannelId::new(raid.channel_id as u64)
-        .send_message(
-            &ctx.http,
-            CreateMessage::new().content(format!(
-                "<@{user}> signed off. Raid starts in {left}.",
-                user = user_id,
-                left = time_left
-            )),
-        )
-        .await?;
-
-    if should_try_promote {
-        // zbuduj exclude_ids – użytkownicy z rolą RESERVE
-        let mut exclude_ids: Vec<i64> = Vec::new();
-        if let Some(gid) = it.guild_id {
-            let roles_map = gid.roles(&ctx.http).await?;
-            let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
-            let parts_for_check = repo::list_participants(&pool, raid_id).await?;
-            for p in &parts_for_check {
-                if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
-                    let has_reserve = member.roles.iter().any(|rid| {
-                        roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
-                    });
-                    if has_reserve { exclude_ids.push(p.user_id); }
-                }
-            }
-        }
-        let _ = repo::promote_reserves_global_order_excluding(
-            &pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
-        ).await?;
-    }
-    let _ =refresh_message(ctx, it, raid_id, "You have been signed out.").await;
     Ok(())
 }
 
@@ -431,7 +386,10 @@ async fn leave_alts(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
         )).await?;
         return Ok(());
     }
-    let _ = repo::remove_user_alts(&pool, raid_id, from_user_id(it.user.id)).await?;
+    let redis = redis_from_ctx(ctx).await?;
+    let ev = queue::RaidEvent::LeaveAlts { raid_id, guild_id: raid.guild_id, user_id: from_user_id(it.user.id) };
+    let corr = queue::publish(&redis, &ev).await?;
+    let _ack = queue::wait_for_ack(&redis, &corr, 900).await?;
     refresh_message(ctx, it, raid_id, "Removed your alts.").await
 }
 

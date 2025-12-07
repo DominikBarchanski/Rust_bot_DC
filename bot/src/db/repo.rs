@@ -472,4 +472,98 @@ pub async fn list_active_raids_by_guild(pool: &PgPool, guild_id: i64) -> anyhow:
     Ok(rows)
 }
 
+/* GUILD RAID LIST MAPPING (persistence for consolidated list) */
+
+#[derive(Debug, FromRow, Clone)]
+pub struct GuildListMappingRow {
+    pub guild_id: i64,
+    pub channel_id: i64,
+    pub message_ids: Vec<i64>,
+}
+
+pub async fn get_guild_raid_list(pool: &PgPool, guild_id: i64) -> anyhow::Result<Option<GuildListMappingRow>> {
+    let row = sqlx::query_as(
+        r#"
+        SELECT guild_id, channel_id, message_ids
+        FROM guild_raid_list
+        WHERE guild_id = $1
+        "#
+    )
+        .bind(guild_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+pub async fn upsert_guild_raid_list(
+    pool: &PgPool,
+    guild_id: i64,
+    channel_id: i64,
+    message_ids: &[i64],
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO guild_raid_list (guild_id, channel_id, message_ids)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (guild_id) DO UPDATE
+          SET channel_id = EXCLUDED.channel_id,
+              message_ids = EXCLUDED.message_ids,
+              updated_at = now()
+        "#
+    )
+        .bind(guild_id)
+        .bind(channel_id)
+        .bind(message_ids)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_guild_raid_list_by_guild(pool: &PgPool, guild_id: i64) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        "DELETE FROM guild_raid_list WHERE guild_id = $1"
+    )
+        .bind(guild_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn delete_guild_raid_list_by_channel(pool: &PgPool, channel_id: i64) -> anyhow::Result<bool> {
+    let res = sqlx::query(
+        "DELETE FROM guild_raid_list WHERE channel_id = $1"
+    )
+        .bind(channel_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn list_all_guild_raid_lists(pool: &PgPool) -> anyhow::Result<Vec<GuildListMappingRow>> {
+    let rows = sqlx::query_as(
+        r#"
+        SELECT guild_id, channel_id, message_ids
+        FROM guild_raid_list
+        ORDER BY guild_id ASC
+        "#
+    )
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+pub async fn get_guild_raid_list_by_channel(pool: &PgPool, channel_id: i64) -> anyhow::Result<Option<GuildListMappingRow>> {
+    let row = sqlx::query_as(
+        r#"
+        SELECT guild_id, channel_id, message_ids
+        FROM guild_raid_list
+        WHERE channel_id = $1
+        "#
+    )
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
 

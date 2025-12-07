@@ -56,3 +56,13 @@ CREATE INDEX IF NOT EXISTS idx_raids_priority_until ON raids (priority_until);
 -- If you previously had UNIQUE(raid_id,user_id), drop it
 ALTER TABLE raid_participants DROP CONSTRAINT IF EXISTS raid_participants_raid_id_user_id_key;
 
+-- Mapping for consolidated "all raids list" message(s) per guild
+CREATE TABLE IF NOT EXISTS guild_raid_list (
+  guild_id    BIGINT PRIMARY KEY,
+  channel_id  BIGINT NOT NULL,
+  message_ids BIGINT[] NOT NULL,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_guild_raid_list_channel ON guild_raid_list(channel_id);
+

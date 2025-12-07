@@ -12,10 +12,14 @@ use chrono_tz::Europe::Warsaw;
 use chrono::Datelike;
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
+use tokio::time::{sleep, Duration};
 
-// In-memory registry of the guild's consolidated raids list messages.
-// Key: guild_id, Value: (channel_id, message_ids[0..=1])
+// Legacy in-memory registry (kept for compatibility but not authoritative).
+// Authoritative registry lives in Redis + DB; we keep a tiny in-process debounce state below.
 pub static ALL_RAID_LIST_MSG: Lazy<DashMap<u64, (u64, Vec<u64>)>> = Lazy::new(DashMap::new);
+
+// Debounce flags per guild to coalesce frequent refreshes
+static PENDING_REFRESH: Lazy<DashMap<u64, ()>> = Lazy::new(DashMap::new);
 
 pub async fn register(ctx: &Context) -> anyhow::Result<()> {
     Command::create_global_command(
@@ -521,10 +525,45 @@ async fn handle_all_raid_list(ctx: &Context, cmd: &CommandInteraction) -> anyhow
         )
         .await;
 
-    let pool = pool_from_ctx(ctx).await?;
-    let chunks = render_all_raids_list(ctx, &pool, gid.get()).await?;
+    let pool = crate::handlers::pool_from_ctx(ctx).await?;
+    let redis = crate::handlers::redis_from_ctx(ctx).await?;
 
-    // Send one or two messages in the invoking channel and store mapping
+    // Check existing mapping from Redis, fallback to DB
+    let existing = match crate::redis_ext::get_guild_list(&redis, gid.get()).await? {
+        Some(m) => Some(m),
+        None => match crate::db::repo::get_guild_raid_list(&pool, gid.get() as i64).await? {
+            Some(r) => {
+                let ids_u64: Vec<u64> = r.message_ids.iter().map(|i| *i as u64).collect();
+                Some((r.channel_id as u64, ids_u64))
+            }
+            None => None,
+        },
+    };
+
+    if let Some((other_chan, _ids)) = existing {
+        if other_chan != cmd.channel_id.get() {
+            let _ = cmd
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new().content(format!(
+                        "❌ Lista dla tego serwera już istnieje w kanale <#{}>. Aby przenieść, najpierw usuń istniejącą lub użyj dedykowanej komendy przeniesienia.",
+                        other_chan
+                    )),
+                )
+                .await;
+            return Ok(());
+        }
+
+        // Same channel -> just trigger refresh/update
+        trigger_refresh(ctx, gid.get()).await;
+        let _ = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().content("Zaktualizowano listę rajdów w tym kanale."))
+            .await;
+        return Ok(());
+    }
+
+    // No mapping yet: render and post
+    let chunks = render_all_raids_list(ctx, &pool, gid.get()).await?;
     let mut ids: Vec<u64> = Vec::new();
     for c in &chunks {
         let m = cmd
@@ -533,6 +572,11 @@ async fn handle_all_raid_list(ctx: &Context, cmd: &CommandInteraction) -> anyhow
             .await?;
         ids.push(m.id.get());
     }
+
+    // Persist to Redis + DB and local cache
+    crate::redis_ext::set_guild_list(&redis, gid.get(), cmd.channel_id.get(), &ids).await?;
+    let ids_i64: Vec<i64> = ids.iter().map(|i| *i as i64).collect();
+    crate::db::repo::upsert_guild_raid_list(&pool, gid.get() as i64, cmd.channel_id.get() as i64, &ids_i64).await?;
     ALL_RAID_LIST_MSG.insert(gid.get(), (cmd.channel_id.get(), ids));
 
     // Finalize the ephemeral response
@@ -654,56 +698,123 @@ async fn render_all_raids_list(_ctx: &Context, pool: &sqlx::PgPool, guild_id: u6
 }
 
 pub async fn refresh_guild_raid_list_if_any(ctx: &Context, guild_id: u64) -> anyhow::Result<()> {
-    if let Some(mut entry) = ALL_RAID_LIST_MSG.get_mut(&guild_id) {
-        let (chan_id, ref mut msg_ids) = *entry.value_mut();
-        let pool = pool_from_ctx(ctx).await?;
-        let chunks = render_all_raids_list(ctx, &pool, guild_id).await?;
-        let channel = ChannelId::new(chan_id);
+    // Backward-compatible shim: redirect to debounced refresh
+    trigger_refresh(ctx, guild_id).await;
+    Ok(())
+}
 
-        match (msg_ids.len(), chunks.len()) {
-            (1, 1) => {
-                let _ = channel
-                    .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
-                    .await;
+pub async fn refresh_all_guild_lists_if_any(ctx: &Context) -> anyhow::Result<()> {
+    let pool = crate::handlers::pool_from_ctx(ctx).await?;
+    let rows = crate::db::repo::list_all_guild_raid_lists(&pool).await?;
+    for r in rows {
+        // spawn per guild to avoid blocking
+        let ctxc = ctx.clone();
+        tokio::spawn(async move {
+            let _ = do_refresh(&ctxc, r.guild_id as u64).await;
+        });
+    }
+    Ok(())
+}
+
+pub async fn trigger_refresh(ctx: &Context, guild_id: u64) {
+    let first = PENDING_REFRESH.insert(guild_id, ()).is_none();
+    if first {
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(2)).await; // debounce bursty events
+            let _ = do_refresh(&ctx2, guild_id).await;
+            PENDING_REFRESH.remove(&guild_id);
+        });
+    }
+}
+
+async fn do_refresh(ctx: &Context, guild_id: u64) -> anyhow::Result<()> {
+    use crate::handlers::{pool_from_ctx, redis_from_ctx};
+    let pool = pool_from_ctx(ctx).await?;
+    let redis = redis_from_ctx(ctx).await?;
+
+    // Resolve mapping from Redis, fallback DB
+    let mapping = match crate::redis_ext::get_guild_list(&redis, guild_id).await? {
+        Some(m) => Some(m),
+        None => match crate::db::repo::get_guild_raid_list(&pool, guild_id as i64).await? {
+            Some(r) => Some((r.channel_id as u64, r.message_ids.iter().map(|i| *i as u64).collect())),
+            None => None,
+        },
+    };
+    let Some((chan_id, mut msg_ids)) = mapping else { return Ok(()); };
+
+    let chunks = render_all_raids_list(ctx, &pool, guild_id).await?;
+    let channel = ChannelId::new(chan_id);
+
+    // Try to edit appropriately; on failures recreate
+    let result: Result<(), serenity::Error> = match (msg_ids.len(), chunks.len()) {
+        (1, 1) => {
+            channel
+                .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
+                .await
+                .map(|_| ())
+        }
+        (1, 2) => {
+            let _ = channel
+                .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
+                .await;
+            match channel
+                .send_message(&ctx.http, CreateMessage::new().content(chunks[1].clone()))
+                .await
+            {
+                Ok(m) => { msg_ids.push(m.id.get()); Ok::<(), serenity::Error>(()) }
+                Err(e) => Err(e),
             }
-            (1, 2) => {
-                let _ = channel
-                    .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
-                    .await;
+        }
+        (2, 1) => {
+            let _ = channel
+                .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
+                .await;
+            let _ = channel.delete_message(&ctx.http, msg_ids[1]).await;
+            msg_ids.truncate(1);
+            Ok(())
+        }
+        (2, 2) => {
+            let _ = channel
+                .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
+                .await;
+            channel
+                .edit_message(&ctx.http, msg_ids[1], EditMessage::new().content(chunks[1].clone()))
+                .await
+                .map(|_| ())
+        }
+        _ => {
+            // Recreate fresh
+            for mid in msg_ids.iter() { let _ = channel.delete_message(&ctx.http, *mid).await; }
+            msg_ids.clear();
+            for c in chunks {
                 let m = channel
-                    .send_message(&ctx.http, CreateMessage::new().content(chunks[1].clone()))
+                    .send_message(&ctx.http, CreateMessage::new().content(c))
                     .await?;
                 msg_ids.push(m.id.get());
             }
-            (2, 1) => {
-                let _ = channel
-                    .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
-                    .await;
-                let _ = channel.delete_message(&ctx.http, msg_ids[1]).await;
-                msg_ids.truncate(1);
-            }
-            (2, 2) => {
-                let _ = channel
-                    .edit_message(&ctx.http, msg_ids[0], EditMessage::new().content(chunks[0].clone()))
-                    .await;
-                let _ = channel
-                    .edit_message(&ctx.http, msg_ids[1], EditMessage::new().content(chunks[1].clone()))
-                    .await;
-            }
-            _ => {
-                // Any other case -> recreate fresh
-                for mid in msg_ids.iter() {
-                    let _ = channel.delete_message(&ctx.http, *mid).await;
-                }
-                msg_ids.clear();
-                for c in chunks {
-                    let m = channel
-                        .send_message(&ctx.http, CreateMessage::new().content(c))
-                        .await?;
-                    msg_ids.push(m.id.get());
-                }
-            }
+            Ok(())
+        }
+    };
+
+    if result.is_err() {
+        // Fallback: recreate everything
+        for mid in msg_ids.iter() { let _ = channel.delete_message(&ctx.http, *mid).await; }
+        msg_ids.clear();
+        let chunks2 = render_all_raids_list(ctx, &pool, guild_id).await?;
+        for c in chunks2 {
+            let m = channel
+                .send_message(&ctx.http, CreateMessage::new().content(c))
+                .await?;
+            msg_ids.push(m.id.get());
         }
     }
+
+    // Persist state (DB + Redis)
+    let ids_i64: Vec<i64> = msg_ids.iter().map(|i| *i as i64).collect();
+    let _ = crate::db::repo::upsert_guild_raid_list(&pool, guild_id as i64, chan_id as i64, &ids_i64).await;
+    let _ = crate::redis_ext::set_guild_list(&redis, guild_id, chan_id, &msg_ids).await;
+    // update compatibility cache
+    ALL_RAID_LIST_MSG.insert(guild_id, (chan_id, msg_ids));
     Ok(())
 }
