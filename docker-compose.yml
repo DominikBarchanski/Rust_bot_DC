@@ -12,12 +12,22 @@ services:
     ports:
       - "5432:5432"
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+
   bot:
     build: ./bot
     depends_on:
       - postgres
+      - redis
     env_file:
       - ./bot/.env
+    environment:
+      - REDIS_URL=redis://redis:6379
     restart: unless-stopped
 
 volumes:
