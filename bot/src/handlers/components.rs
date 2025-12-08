@@ -312,8 +312,8 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     sleep(Duration::from_secs(5)).await;
     let _ = it.delete_response(&ctx.http).await;
 
-    // also try to refresh guild list (if any was created via /all_raid_list)
-    let _ = crate::commands::raid::refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
+    // also try to refresh guild list immediately (force, non-debounced)
+    let _ = crate::commands::raid::force_refresh_guild_raid_list(ctx, raid.guild_id as u64).await;
 
     JOIN_STATE.remove(&key);
     Ok(())
@@ -405,8 +405,8 @@ async fn refresh_message(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid
         it.create_response(&ctx.http, CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new().content(tip).ephemeral(true)
         )).await?;
-    // refresh guild list if any
-    let _ = crate::commands::raid::refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
+    // refresh guild list immediately (force, non-debounced)
+    let _ = crate::commands::raid::force_refresh_guild_raid_list(ctx, raid.guild_id as u64).await;
     Ok(())
 }
 

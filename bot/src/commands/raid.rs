@@ -728,6 +728,11 @@ pub async fn trigger_refresh(ctx: &Context, guild_id: u64) {
     }
 }
 
+// Immediate, non-debounced refresh. Use after a successful write that should reflect instantly.
+pub async fn force_refresh_guild_raid_list(ctx: &Context, guild_id: u64) -> anyhow::Result<()> {
+    do_refresh(ctx, guild_id).await
+}
+
 async fn do_refresh(ctx: &Context, guild_id: u64) -> anyhow::Result<()> {
     use crate::handlers::{pool_from_ctx, redis_from_ctx};
     let pool = pool_from_ctx(ctx).await?;
