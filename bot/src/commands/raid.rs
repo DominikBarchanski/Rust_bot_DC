@@ -43,6 +43,8 @@ pub async fn register(ctx: &Context) -> anyhow::Result<()> {
                     .add_string_choice("Hc_Alzanor", "Hc_Alzanor")
                     .add_string_choice("Hc_A8-A6", "Hc_A8-A6")
                     .add_string_choice("Hc_A1-A5", "Hc_A1-A5")
+                    .add_string_choice("Nezarun", "Nezarun")
+                    .add_string_choice("Nezarun_v2", "Nezarun_v2")
             )
             .add_option(CreateCommandOption::new(CommandOptionType::String, "raid_date", "Format: HH:MM YYYY-MM-DD").required(true))
             .add_option(CreateCommandOption::new(CommandOptionType::Integer, "max_players", "Main slots").required(true))
@@ -72,6 +74,8 @@ fn emoji_and_slug(raid_choice: &str) -> (&'static str, String) {
         "valehir" => "💀",
         "alzanor" => "🥶",
         "sky-tower" => "🗼",
+        "nezarun" => "⚜️",
+        "nezarun_v2" => "🐙",
         s if s.starts_with("hc-") => "🔥", // Hc_* variants
         _ => "🏷️", // fallback
     };
