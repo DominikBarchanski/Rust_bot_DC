@@ -342,6 +342,90 @@ pub async fn promote_reserves_with_alt_limits_excluding(
 
     Ok(())
 }
+
+/// Promote reserves giving priority to users who hold the priority role(s) during an active window.
+/// Order:
+/// 1) Non-alt reserves first, priority users first within that group by (priority -> joined_at ASC)
+/// 2) Alt reserves next within remaining free slots and alt cap, also ordered by (priority -> joined_at ASC)
+/// Users listed in `exclude_user_ids` are skipped (e.g., members with RESERVE_ROLE_NAME role).
+pub async fn promote_reserves_with_priority_excluding(
+    pool: &PgPool,
+    raid_id: Uuid,
+    max_players: i32,
+    max_alts: i32,
+    priority_user_ids: &[i64],
+    exclude_user_ids: &[i64],
+) -> anyhow::Result<()> {
+    let mains = super::repo::count_mains(pool, raid_id).await? as i32;
+    let mut free = (max_players - mains).max(0);
+    if free <= 0 { return Ok(()); }
+
+    // 1) Promote non-alt reserves (priority first)
+    let promoted_non_alt = sqlx::query_scalar!(
+        r#"
+        WITH c AS (
+          SELECT id
+          FROM raid_participants
+          WHERE raid_id = $1 AND is_main = FALSE AND is_alt = FALSE
+            AND NOT (user_id = ANY($4::BIGINT[]))
+          ORDER BY
+            CASE WHEN user_id = ANY($3::BIGINT[]) THEN 0 ELSE 1 END,
+            joined_at ASC
+          LIMIT $2
+        )
+        UPDATE raid_participants p
+        SET is_main = TRUE, is_reserve = FALSE
+        FROM c
+        WHERE p.id = c.id
+        RETURNING 1
+        "#,
+        raid_id,
+        free as i64,
+        priority_user_ids,
+        exclude_user_ids
+    )
+        .fetch_all(pool)
+        .await?
+        .len() as i32;
+
+    free -= promoted_non_alt;
+    if free <= 0 { return Ok(()); }
+
+    // 2) Alt reserves under alt cap (priority first)
+    let current_alt_mains = super::repo::count_alt_mains(pool, raid_id).await? as i32;
+    let alt_left = (max_alts - current_alt_mains).max(0);
+    if alt_left <= 0 { return Ok(()); }
+
+    let promote_alt = free.min(alt_left);
+    let _promoted_alts = sqlx::query_scalar!(
+        r#"
+        WITH c AS (
+          SELECT id
+          FROM raid_participants
+          WHERE raid_id = $1 AND is_main = FALSE AND is_alt = TRUE
+            AND NOT (user_id = ANY($4::BIGINT[]))
+          ORDER BY
+            CASE WHEN user_id = ANY($3::BIGINT[]) THEN 0 ELSE 1 END,
+            joined_at ASC
+          LIMIT $2
+        )
+        UPDATE raid_participants p
+        SET is_main = TRUE, is_reserve = FALSE
+        FROM c
+        WHERE p.id = c.id
+        RETURNING 1
+        "#,
+        raid_id,
+        promote_alt as i64,
+        priority_user_ids,
+        exclude_user_ids
+    )
+        .fetch_all(pool)
+        .await?
+        .len() as i32;
+
+    Ok(())
+}
 #[derive(Debug, FromRow)]
 pub struct RestoreRaidRow {
     pub id: Uuid,

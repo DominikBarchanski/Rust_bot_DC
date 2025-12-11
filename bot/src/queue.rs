@@ -206,29 +206,54 @@ async fn handle_join(
         let _ = repo::insert_or_replace_main(pool, raid_id, user_id, joined_as, main_now, tag_suffix).await?;
     }
 
-    // After join, run promotion if priority window passed
+    // After join, run promotion
     let raid = repo::get_raid(pool, raid_id).await?;
-    let should_try_promote = match raid.priority_until { Some(until) => chrono::Utc::now() >= until, None => true };
-    if should_try_promote {
-        let mut exclude_ids: Vec<i64> = Vec::new();
-        let gid = GuildId::new(guild_id as u64);
-        if let Ok(roles_map) = gid.roles(&ctx.http).await {
-            let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
-            let parts_for_check = repo::list_participants(pool, raid_id).await?;
-            for p in &parts_for_check {
-                if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
-                    let has_reserve = member.roles.iter().any(|rid| {
-                        roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
-                    });
-                    if has_reserve { exclude_ids.push(p.user_id); }
+    let now = chrono::Utc::now();
+    let mut exclude_ids: Vec<i64> = Vec::new();
+    let mut priority_user_ids: Vec<i64> = Vec::new();
+    let gid = GuildId::new(guild_id as u64);
+    if let Ok(roles_map) = gid.roles(&ctx.http).await {
+        let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
+        let parts_for_check = repo::list_participants(pool, raid_id).await?;
+        // Priority role IDs configured on the raid (array of BIGINT)
+        let pr_ids: Vec<i64> = raid
+            .priority_role_id
+            .as_ref()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let pr_set: std::collections::HashSet<u64> = pr_ids.iter().map(|x| *x as u64).collect();
+
+        for p in &parts_for_check {
+            if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
+                // exclude: users with reserve role name
+                let has_reserve = member.roles.iter().any(|rid| {
+                    roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
+                });
+                if has_reserve { exclude_ids.push(p.user_id); }
+
+                // priority: users that have any of the configured priority role IDs
+                if !pr_set.is_empty() {
+                    let has_priority = member.roles.iter().any(|rid| pr_set.contains(&rid.get()));
+                    if has_priority { priority_user_ids.push(p.user_id); }
                 }
             }
         }
-        let _ = repo::promote_reserves_global_order_excluding(pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids).await;
     }
 
-    // trigger consolidated list refresh
-    crate::commands::raid::trigger_refresh(ctx, guild_id as u64).await;
+    // Choose promotion strategy
+    if raid.priority_until.map(|u| now < u).unwrap_or(false) && !priority_user_ids.is_empty() {
+        let _ = repo::promote_reserves_with_priority_excluding(
+            pool, raid_id, raid.max_players, raid.max_alts, &priority_user_ids, &exclude_ids
+        ).await;
+    } else {
+        // default ordering
+        let _ = repo::promote_reserves_with_alt_limits_excluding(
+            pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
+        ).await;
+    }
+
+    // Force refresh consolidated list immediately
+    let _ = crate::commands::raid::force_refresh_guild_raid_list(ctx, guild_id as u64).await;
     Ok(AckPayload { ok: true, removed_main: None, removed_alts: None })
 }
 
@@ -242,28 +267,49 @@ async fn handle_leave_all(
     let removed_main = repo::remove_participant(pool, raid_id, user_id).await.unwrap_or(0);
     let removed_alts = repo::remove_user_alts(pool, raid_id, user_id).await.unwrap_or(0);
 
-    // Promote immediately after a leave (regardless of priority window),
-    // while respecting non-alt-first order and alt cap.
+    // Promote immediately after a leave.
     let raid = repo::get_raid(pool, raid_id).await?;
+    let now = chrono::Utc::now();
     let mut exclude_ids: Vec<i64> = Vec::new();
+    let mut priority_user_ids: Vec<i64> = Vec::new();
     let gid = GuildId::new(guild_id as u64);
     if let Ok(roles_map) = gid.roles(&ctx.http).await {
         let reserve_role_name = std::env::var("RESERVE_ROLE_NAME").unwrap_or_else(|_| "reserve".to_string());
         let parts_for_check = repo::list_participants(pool, raid_id).await?;
+        // Priority role IDs configured on the raid (array of BIGINT)
+        let pr_ids: Vec<i64> = raid
+            .priority_role_id
+            .as_ref()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let pr_set: std::collections::HashSet<u64> = pr_ids.iter().map(|x| *x as u64).collect();
+
         for p in &parts_for_check {
             if let Ok(member) = gid.member(&ctx.http, UserId::new(p.user_id as u64)).await {
                 let has_reserve = member.roles.iter().any(|rid| {
                     roles_map.get(rid).map_or(false, |r| r.name.eq_ignore_ascii_case(&reserve_role_name))
                 });
                 if has_reserve { exclude_ids.push(p.user_id); }
+
+                if !pr_set.is_empty() {
+                    let has_priority = member.roles.iter().any(|rid| pr_set.contains(&rid.get()));
+                    if has_priority { priority_user_ids.push(p.user_id); }
+                }
             }
         }
     }
-    let _ = repo::promote_reserves_with_alt_limits_excluding(
-        pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
-    ).await;
 
-    crate::commands::raid::trigger_refresh(ctx, guild_id as u64).await;
+    if raid.priority_until.map(|u| now < u).unwrap_or(false) && !priority_user_ids.is_empty() {
+        let _ = repo::promote_reserves_with_priority_excluding(
+            pool, raid_id, raid.max_players, raid.max_alts, &priority_user_ids, &exclude_ids
+        ).await;
+    } else {
+        let _ = repo::promote_reserves_with_alt_limits_excluding(
+            pool, raid_id, raid.max_players, raid.max_alts, &exclude_ids
+        ).await;
+    }
+
+    let _ = crate::commands::raid::force_refresh_guild_raid_list(ctx, guild_id as u64).await;
     Ok(AckPayload { ok: true, removed_main: Some(removed_main), removed_alts: Some(removed_alts) })
 }
 

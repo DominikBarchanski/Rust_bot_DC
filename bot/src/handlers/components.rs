@@ -427,6 +427,16 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         )).await?;
         return Ok(());
     }
+
+    // Immediate ACK to avoid Discord 3s timeout; we'll edit this response below.
+    let _ = it.create_response(
+        &ctx.http,
+        CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("Loading owner controls…")
+                .ephemeral(true),
+        ),
+    ).await;
     let gid_u64 = raid.guild_id as u64;
     let mut name_map: HashMap<i64, String> = HashMap::new();
 
@@ -504,30 +514,28 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     // Any participants for Kick
 
 
-    it.create_response(&ctx.http, CreateInteractionResponse::Message(
-        CreateInteractionResponseMessage::new()
-            .content("Owner controls")
-            .ephemeral(true)
-            .components(vec![
-                menus::user_select_row(format!("r:pr:{raid_id}"), "Promote reserve → main", promote_opts),
-                menus::user_select_row(format!("r:mr:{raid_id}"), "Promote main → reserve ", promote_to_reserve_opts),
-                menus::user_select_row(format!("r:kk:{raid_id}"), "Kick user ", kick_opts),
-                CreateActionRow::Buttons(vec![
-                    CreateButton::new(format!("r:cx:{raid_id}"))
-                        .label("Cancel Raid (DM all + delete in 1h)")
-                        .style(ButtonStyle::Danger),
-                    CreateButton::new(format!("r:cl:{raid_id}"))
-                        .label("Close")
-                        .style(ButtonStyle::Secondary),
-                    CreateButton::new(format!("r:not:{raid_id}"))
-                        .label("Notify All Participants ")
-                        .style(ButtonStyle::Secondary),
-                    CreateButton::new(format!("r:cho:{raid_id}"))
-                        .label("Change Owner")
-                        .style(ButtonStyle::Primary),
-                ])
+    it.edit_response(&ctx.http, EditInteractionResponse::new()
+        .content("Owner controls")
+        .components(vec![
+            menus::user_select_row(format!("r:pr:{raid_id}"), "Promote reserve → main", promote_opts),
+            menus::user_select_row(format!("r:mr:{raid_id}"), "Promote main → reserve ", promote_to_reserve_opts),
+            menus::user_select_row(format!("r:kk:{raid_id}"), "Kick user ", kick_opts),
+            CreateActionRow::Buttons(vec![
+                CreateButton::new(format!("r:cx:{raid_id}"))
+                    .label("Cancel Raid (DM all + delete in 1h)")
+                    .style(ButtonStyle::Danger),
+                CreateButton::new(format!("r:cl:{raid_id}"))
+                    .label("Close")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new(format!("r:not:{raid_id}"))
+                    .label("Notify All Participants ")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new(format!("r:cho:{raid_id}"))
+                    .label("Change Owner")
+                    .style(ButtonStyle::Primary),
             ])
-    )).await?;
+        ])
+    ).await?;
     Ok(())
 }
 
