@@ -241,7 +241,8 @@ async fn handle_join(
     }
 
     // Choose promotion strategy
-    if raid.priority_until.map(|u| now < u).unwrap_or(false) && !priority_user_ids.is_empty() {
+    // During active priority window: promote ONLY users with priority roles.
+    if raid.priority_until.map(|u| now < u).unwrap_or(false) {
         let _ = repo::promote_reserves_with_priority_excluding(
             pool, raid_id, raid.max_players, raid.max_alts, &priority_user_ids, &exclude_ids
         ).await;
@@ -299,7 +300,8 @@ async fn handle_leave_all(
         }
     }
 
-    if raid.priority_until.map(|u| now < u).unwrap_or(false) && !priority_user_ids.is_empty() {
+    // During active priority window: promote ONLY users with priority roles.
+    if raid.priority_until.map(|u| now < u).unwrap_or(false) {
         let _ = repo::promote_reserves_with_priority_excluding(
             pool, raid_id, raid.max_players, raid.max_alts, &priority_user_ids, &exclude_ids
         ).await;

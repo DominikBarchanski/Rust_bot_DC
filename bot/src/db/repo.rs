@@ -368,9 +368,8 @@ pub async fn promote_reserves_with_priority_excluding(
           FROM raid_participants
           WHERE raid_id = $1 AND is_main = FALSE AND is_alt = FALSE
             AND NOT (user_id = ANY($4::BIGINT[]))
-          ORDER BY
-            CASE WHEN user_id = ANY($3::BIGINT[]) THEN 0 ELSE 1 END,
-            joined_at ASC
+            AND (user_id = ANY($3::BIGINT[]))
+          ORDER BY joined_at ASC
           LIMIT $2
         )
         UPDATE raid_participants p
@@ -404,9 +403,8 @@ pub async fn promote_reserves_with_priority_excluding(
           FROM raid_participants
           WHERE raid_id = $1 AND is_main = FALSE AND is_alt = TRUE
             AND NOT (user_id = ANY($4::BIGINT[]))
-          ORDER BY
-            CASE WHEN user_id = ANY($3::BIGINT[]) THEN 0 ELSE 1 END,
-            joined_at ASC
+            AND (user_id = ANY($3::BIGINT[]))
+          ORDER BY joined_at ASC
           LIMIT $2
         )
         UPDATE raid_participants p
