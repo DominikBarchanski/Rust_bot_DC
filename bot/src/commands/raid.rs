@@ -75,7 +75,7 @@ fn emoji_and_slug(raid_choice: &str) -> (&'static str, String) {
         "alzanor" => "🥶",
         "sky-tower" => "🗼",
         "nezarun" => "⚜️",
-        "nezarun_v2" => "🐙",
+        "nezarun-v2" => "🐙",
         s if s.starts_with("hc-") => "🔥", // Hc_* variants
         _ => "🏷️", // fallback
     };
