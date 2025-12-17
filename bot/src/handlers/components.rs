@@ -221,16 +221,37 @@ async fn change_sp_start(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid
         )).await?;
         return Ok(());
     };
-    let active_sp = main.joined_as.split('/').nth(1).map(|s| s.trim().to_string()).unwrap_or_else(|| "SP1".to_string());
-    let mut items: Vec<String> = vec![active_sp.clone()];
-    for s in main.extra_sps.iter() {
-        if !items.iter().any(|x| x.eq_ignore_ascii_case(s)) { items.push(s.clone()); }
-    }
-    let options: Vec<CreateSelectMenuOption> = items.into_iter().map(|label| {
-        let mut opt = CreateSelectMenuOption::new(&label, &label);
-        if label.eq_ignore_ascii_case(&active_sp) { opt = opt.default_selection(true); }
-        opt
-    }).collect();
+    // Derive class and active SP
+    let class = main
+        .joined_as
+        .split('/')
+        .next()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "MSW".to_string());
+    let active_sp = main
+        .joined_as
+        .split('/')
+        .nth(1)
+        .map(|s| s.trim().to_ascii_uppercase())
+        .unwrap_or_else(|| "SP1".to_string());
+
+    // Full allowed SP set for the class (not just saved extras)
+    let allowed: Vec<i32> = if class.eq_ignore_ascii_case("MSW") {
+        vec![1, 2, 3, 4, 9, 10, 11]
+    } else {
+        (1..=11).collect()
+    };
+    let options: Vec<CreateSelectMenuOption> = allowed
+        .into_iter()
+        .map(|i| {
+            let label = format!("SP{}", i);
+            let mut opt = CreateSelectMenuOption::new(&label, &label);
+            if label.eq_ignore_ascii_case(&active_sp) {
+                opt = opt.default_selection(true);
+            }
+            opt
+        })
+        .collect();
 
     let menu = CreateSelectMenu::new(
         format!("r:cspick:{raid_id}"),
@@ -239,7 +260,7 @@ async fn change_sp_start(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid
 
     it.create_response(&ctx.http, CreateInteractionResponse::Message(
         CreateInteractionResponseMessage::new()
-            .content("Change your active SP:")
+            .content(format!("Change your active SP (class: {}):", class))
             .ephemeral(true)
             .components(vec![CreateActionRow::SelectMenu(menu)])
     )).await?;
@@ -692,9 +713,9 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
                 CreateButton::new(format!("r:not:{raid_id}"))
                     .label("Notify All Participants ")
                     .style(ButtonStyle::Secondary),
-                CreateButton::new(format!("r:cl:{raid_id}"))
-                    .label("Close")
-                    .style(ButtonStyle::Secondary),
+                CreateButton::new(format!("r:cx:{raid_id}"))
+                    .label("Cancel Raid")
+                    .style(ButtonStyle::Danger),
             ])
         ])
     ).await?;
