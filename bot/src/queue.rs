@@ -30,6 +30,18 @@ pub enum RaidEvent {
         guild_id: i64,
         user_id: i64,
     },
+    AddSp {
+        raid_id: Uuid,
+        guild_id: i64,
+        user_id: i64,
+        sp: String,
+    },
+    ChangeSp {
+        raid_id: Uuid,
+        guild_id: i64,
+        user_id: i64,
+        sp: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,6 +164,12 @@ pub async fn run_consumer(ctx: DiscordContext, pool: sqlx::PgPool, redis: redis:
                     Ok(RaidEvent::LeaveAlts { raid_id, guild_id, user_id }) => {
                         handle_leave_alts(&ctx, &pool, raid_id, guild_id, user_id).await
                     }
+                    Ok(RaidEvent::AddSp { raid_id, guild_id, user_id, sp }) => {
+                        handle_add_sp(&ctx, &pool, raid_id, guild_id, user_id, sp).await
+                    }
+                    Ok(RaidEvent::ChangeSp { raid_id, guild_id, user_id, sp }) => {
+                        handle_change_sp(&ctx, &pool, raid_id, guild_id, user_id, sp).await
+                    }
                     Err(e) => { eprintln!("queue: bad payload: {e:#}"); Ok(AckPayload { ok: false, removed_main: None, removed_alts: None }) }
                 };
 
@@ -241,8 +259,9 @@ async fn handle_join(
     }
 
     // Choose promotion strategy
-    // During active priority window: promote ONLY users with priority roles.
-    if raid.priority_until.map(|u| now < u).unwrap_or(false) {
+    // During active priority window (or indefinite when is_priority=true and no until): promote ONLY users with priority roles.
+    let active_priority = raid.is_priority && raid.priority_until.map(|u| now < u).unwrap_or(true);
+    if active_priority {
         let _ = repo::promote_reserves_with_priority_excluding(
             pool, raid_id, raid.max_players, raid.max_alts, &priority_user_ids, &exclude_ids
         ).await;
@@ -300,8 +319,9 @@ async fn handle_leave_all(
         }
     }
 
-    // During active priority window: promote ONLY users with priority roles.
-    if raid.priority_until.map(|u| now < u).unwrap_or(false) {
+    // During active priority window (or indefinite when is_priority=true and no until): promote ONLY users with priority roles.
+    let active_priority = raid.is_priority && raid.priority_until.map(|u| now < u).unwrap_or(true);
+    if active_priority {
         let _ = repo::promote_reserves_with_priority_excluding(
             pool, raid_id, raid.max_players, raid.max_alts, &priority_user_ids, &exclude_ids
         ).await;
@@ -326,4 +346,40 @@ async fn handle_leave_alts(
     // Consolidated list isn't affected by alt-only changes in count of mains, but keep it consistent anyway
     crate::commands::raid::trigger_refresh(ctx, guild_id as u64).await;
     Ok(AckPayload { ok: true, removed_main: None, removed_alts: Some(removed) })
+}
+
+async fn handle_add_sp(
+    ctx: &DiscordContext,
+    pool: &sqlx::PgPool,
+    raid_id: Uuid,
+    guild_id: i64,
+    user_id: i64,
+    sp: String,
+) -> anyhow::Result<AckPayload> {
+    // Append SP to user's main row
+    repo::append_extra_sp(pool, raid_id, user_id, &sp).await?;
+    // Trigger both immediate and backup refresh of consolidated list (embed is refreshed by the interaction handler)
+    let _ = crate::commands::raid::force_refresh_guild_raid_list(ctx, guild_id as u64).await;
+    crate::commands::raid::trigger_refresh(ctx, guild_id as u64).await;
+    Ok(AckPayload { ok: true, removed_main: None, removed_alts: None })
+}
+
+async fn handle_change_sp(
+    ctx: &DiscordContext,
+    pool: &sqlx::PgPool,
+    raid_id: Uuid,
+    guild_id: i64,
+    user_id: i64,
+    sp: String,
+) -> anyhow::Result<AckPayload> {
+    // Read current main row to get class part
+    if let Some(main) = repo::get_user_main_row(pool, raid_id, user_id).await? {
+        let class_part = main.joined_as.split('/').next().map(|s| s.trim().to_string()).unwrap_or_else(|| "MSW".to_string());
+        repo::set_active_sp(pool, raid_id, user_id, &class_part, &sp).await?;
+        let _ = crate::commands::raid::force_refresh_guild_raid_list(ctx, guild_id as u64).await;
+        crate::commands::raid::trigger_refresh(ctx, guild_id as u64).await;
+        Ok(AckPayload { ok: true, removed_main: None, removed_alts: None })
+    } else {
+        Ok(AckPayload { ok: false, removed_main: None, removed_alts: None })
+    }
 }

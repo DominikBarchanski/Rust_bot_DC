@@ -38,7 +38,20 @@ fn render_raid_embed_inner(ctx_guild: Option<(&Context, u64)>, raid: &Raid, part
     let mut lines: Vec<String> = Vec::with_capacity(slots);
     for i in 0..slots {
         if let Some(p) = mains.get(i) {
-            let label = decorate_joined_as(ctx_guild, &p.joined_as);
+            let mut label = decorate_joined_as(ctx_guild, &p.joined_as);
+            if !p.extra_sps.is_empty() {
+                // show extra SPs except the active one present in joined_as
+                let active_sp = p.joined_as.split('/').nth(1).map(|s| s.trim().to_ascii_uppercase());
+                let extras: Vec<String> = p
+                    .extra_sps
+                    .iter()
+                    .map(|s| s.trim().to_ascii_uppercase())
+                    .filter(|s| Some(s.as_str()) != active_sp.as_deref())
+                    .collect();
+                if !extras.is_empty() {
+                    label.push_str(&format!(" ({})", extras.join(", ")));
+                }
+            }
             let suffix_role = p.tag_suffix.as_str();
             let suffix = if p.is_alt { " (ALT)" } else { "" };
             lines.push(format!("{}. {} {} {}{}", i + 1, label, mention_user( p.user_id), suffix,suffix_role));
@@ -74,7 +87,19 @@ fn render_raid_embed_inner(ctx_guild: Option<(&Context, u64)>, raid: &Raid, part
     if !reserves.is_empty() {
         let mut rlines = Vec::new();
         for p in reserves.iter().take(10) {
-            let label = decorate_joined_as(ctx_guild, &p.joined_as);
+            let mut label = decorate_joined_as(ctx_guild, &p.joined_as);
+            if !p.extra_sps.is_empty() {
+                let active_sp = p.joined_as.split('/').nth(1).map(|s| s.trim().to_ascii_uppercase());
+                let extras: Vec<String> = p
+                    .extra_sps
+                    .iter()
+                    .map(|s| s.trim().to_ascii_uppercase())
+                    .filter(|s| Some(s.as_str()) != active_sp.as_deref())
+                    .collect();
+                if !extras.is_empty() {
+                    label.push_str(&format!(" ({})", extras.join(", ")));
+                }
+            }
             let suffix = if p.is_alt { " (ALT)" } else { "" };
             let suffix_role = p.tag_suffix.as_str();
             rlines.push(format!("• {} {} {}{}", label, mention_user( p.user_id), suffix,suffix_role));

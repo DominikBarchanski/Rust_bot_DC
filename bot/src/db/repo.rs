@@ -71,7 +71,7 @@ pub async fn list_participants(pool: &PgPool, raid_id: Uuid) -> anyhow::Result<V
     let rows = sqlx::query_as!(
         RaidParticipant,
         r#"
-        SELECT id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt, tag_suffix
+        SELECT id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt, tag_suffix, extra_sps
         FROM raid_participants
         WHERE raid_id = $1
         ORDER BY joined_at ASC
@@ -132,7 +132,7 @@ pub async fn insert_or_replace_main(
         UPDATE raid_participants
         SET joined_as = $1, is_main = $2, is_reserve = NOT $2, is_alt = FALSE, tag_suffix = $5
         WHERE raid_id = $3 AND user_id = $4 AND is_alt = FALSE
-        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt, tag_suffix
+        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt, tag_suffix, extra_sps
         "#,
         joined_as, main_now, raid_id, user_id,tag_suffix
     ).fetch_optional(pool).await?;
@@ -147,7 +147,7 @@ pub async fn insert_or_replace_main(
         r#"
         INSERT INTO raid_participants (id, raid_id, user_id, is_main, joined_as, is_reserve, is_alt,tag_suffix)
         VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7)
-        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt,tag_suffix
+        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt,tag_suffix, extra_sps
         "#,
         id, raid_id, user_id, main_now, joined_as, !main_now,tag_suffix
     ).fetch_one(pool).await?;
@@ -168,11 +168,52 @@ pub async fn insert_alt(
         r#"
         INSERT INTO raid_participants (id, raid_id, user_id, is_main, joined_as, is_reserve, is_alt,tag_suffix)
         VALUES ($1,$2,$3,$4,$5,$6,TRUE,$7)
-        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt,tag_suffix
+        RETURNING id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt,tag_suffix, extra_sps
         "#,
         id, raid_id, user_id, main_now, joined_as, !main_now,tag_suffix
     ).fetch_one(pool).await?;
     Ok(row)
+}
+
+/* Extra SP management */
+pub async fn get_user_main_row(pool: &PgPool, raid_id: Uuid, user_id: i64) -> anyhow::Result<Option<RaidParticipant>> {
+    let row = sqlx::query_as!(
+        RaidParticipant,
+        r#"
+        SELECT id, raid_id, user_id, is_main, joined_as, is_reserve, joined_at, is_alt, tag_suffix, extra_sps
+        FROM raid_participants
+        WHERE raid_id = $1 AND user_id = $2 AND is_alt = FALSE
+        ORDER BY is_main DESC, joined_at ASC
+        LIMIT 1
+        "#,
+        raid_id, user_id
+    ).fetch_optional(pool).await?;
+    Ok(row)
+}
+
+pub async fn append_extra_sp(pool: &PgPool, raid_id: Uuid, user_id: i64, sp: &str) -> anyhow::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE raid_participants
+        SET extra_sps = CASE WHEN NOT ($3 = ANY(extra_sps)) THEN array_append(extra_sps, $3) ELSE extra_sps END
+        WHERE raid_id = $1 AND user_id = $2 AND is_alt = FALSE
+        "#,
+        raid_id, user_id, sp
+    ).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn set_active_sp(pool: &PgPool, raid_id: Uuid, user_id: i64, class_part: &str, sp: &str) -> anyhow::Result<()> {
+    let new_joined = format!("{} / {}", class_part, sp);
+    sqlx::query!(
+        r#"
+        UPDATE raid_participants
+        SET joined_as = $3
+        WHERE raid_id = $1 AND user_id = $2 AND is_alt = FALSE
+        "#,
+        raid_id, user_id, new_joined
+    ).execute(pool).await?;
+    Ok(())
 }
 
 pub async fn remove_participant(pool: &PgPool, raid_id: Uuid, user_id: i64) -> anyhow::Result<u64> {

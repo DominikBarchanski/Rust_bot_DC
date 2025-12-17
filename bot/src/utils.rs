@@ -195,6 +195,12 @@ pub fn parse_component_id(s: &str) -> Option<(String, String, Uuid)> {
         ["cho",uuid]    => uuid.parse().ok().map(|u| ("cho".into(),"".into(),u)),
         ["chp",uuid]    => uuid.parse().ok().map(|u| ("chp".into(),"".into(),u)),
         ["chc",uuid]    => uuid.parse().ok().map(|u| ("chc".into(),"".into(),u)),
+        ["mgp","prev",uuid] => uuid.parse().ok().map(|u| ("mgp".into(),"prev".into(),u)),
+        ["mgp","next",uuid] => uuid.parse().ok().map(|u| ("mgp".into(),"next".into(),u)),
+        ["asp",uuid]    => uuid.parse().ok().map(|u| ("asp".into(),"".into(),u)),
+        ["aspick",uuid] => uuid.parse().ok().map(|u| ("aspick".into(),"".into(),u)),
+        ["csp",uuid]    => uuid.parse().ok().map(|u| ("csp".into(),"".into(),u)),
+        ["cspick",uuid] => uuid.parse().ok().map(|u| ("cspick".into(),"".into(),u)),
 
         _ => None,
     }

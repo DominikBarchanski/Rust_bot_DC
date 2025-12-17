@@ -36,4 +36,5 @@ pub struct RaidParticipant {
     pub joined_at: DateTime<Utc>,
     pub is_alt: bool,
     pub tag_suffix: String,
+    pub extra_sps: Vec<String>,
 }

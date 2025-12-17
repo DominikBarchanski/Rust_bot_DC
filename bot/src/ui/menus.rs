@@ -25,6 +25,18 @@ pub fn main_buttons_row(raid_id: Uuid) -> CreateActionRow {
     ])
 }
 
+/* Additional SP controls row */
+pub fn sp_buttons_row(raid_id: Uuid) -> CreateActionRow {
+    CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("r:asp:{raid_id}"))
+            .label("Add another SP")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new(format!("r:csp:{raid_id}"))
+            .label("Change SP")
+            .style(ButtonStyle::Primary),
+    ])
+}
+
 /* Ephemeral confirm/cancel row */
 pub fn confirm_row(raid_id: Uuid, main: bool) -> CreateActionRow {
     CreateActionRow::Buttons(vec![

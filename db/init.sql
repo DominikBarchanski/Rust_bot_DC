@@ -40,6 +40,8 @@ ALTER TABLE raids
 
 ALTER TABLE raid_participants
   ADD COLUMN IF NOT EXISTS tag_suffix TEXT NOT NULL DEFAULT '';
+ALTER TABLE raid_participants
+  ADD COLUMN IF NOT EXISTS extra_sps TEXT[] NOT NULL DEFAULT '{}';
 DO $$
 BEGIN
   IF NOT EXISTS (

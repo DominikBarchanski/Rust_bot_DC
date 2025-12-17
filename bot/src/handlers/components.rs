@@ -13,6 +13,7 @@ use serenity::builder::{
     CreateInteractionResponseMessage,
     EditInteractionResponse,
 };
+use serenity::builder::{CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption};
 use chrono_tz::Europe::Warsaw;
 use serenity::builder::{EditMessage, CreateMessage};
 use tokio::time::{sleep, Duration};
@@ -28,6 +29,9 @@ struct JoinSelection {
 
 static JOIN_STATE: Lazy<DashMap<(u64, Uuid), JoinSelection>> = Lazy::new(DashMap::new);
 static OWNER_CHANGE: Lazy<DashMap<(u64, Uuid), u64>> = Lazy::new(DashMap::new);
+// Manage menu pagination state: key = (owner_user_id, raid_id) -> page idx (0..)
+static OWNER_MGMT_PAGE: Lazy<DashMap<(u64, Uuid), usize>> = Lazy::new(DashMap::new);
+const MGMT_PAGE_SIZE: usize = 25; // Discord limit for select options
 pub async fn handle_component(ctx: &Context, it: &ComponentInteraction) -> anyhow::Result<()> {
     let Some((kind, which, raid_id)) = parse_component_id(&it.data.custom_id) else { return Ok(()); };
 
@@ -40,6 +44,8 @@ pub async fn handle_component(ctx: &Context, it: &ComponentInteraction) -> anyho
         ("l",  "") => leave_all(ctx, it, raid_id).await?,
         ("la", "") => leave_alts(ctx, it, raid_id).await?,
         ("mg", "") => owner_manage(ctx, it, raid_id).await?,
+        ("mgp", "prev") => owner_manage_page(ctx, it, raid_id, -1).await?,
+        ("mgp", "next") => owner_manage_page(ctx, it, raid_id, 1).await?,
         ("pr", "") => owner_promote(ctx, it, raid_id).await?,
         ("mr", "") => owner_move_to_reserve(ctx, it, raid_id).await?,
         ("kk", "") => owner_kick(ctx, it, raid_id).await?,
@@ -49,6 +55,10 @@ pub async fn handle_component(ctx: &Context, it: &ComponentInteraction) -> anyho
         ("cho", "") => owner_change_start(ctx, it, raid_id).await?,   // show picker
         ("chp", "") => owner_change_pick(ctx, it, raid_id).await?,    // store pick
         ("chc", "") => owner_change_confirm(ctx, it, raid_id).await?, // confirm + transfer
+        ("asp", "") => add_sp_start(ctx, it, raid_id).await?,
+        ("aspick", "") => add_sp_pick(ctx, it, raid_id).await?,
+        ("csp", "") => change_sp_start(ctx, it, raid_id).await?,
+        ("cspick", "") => change_sp_pick(ctx, it, raid_id).await?,
         _ => {}
     }
 
@@ -127,6 +137,141 @@ async fn save_pick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid, is_c
         ),
     )
         .await?;
+    Ok(())
+}
+
+/* === SP management (extra SPs and changing active SP) === */
+async fn add_sp_start(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
+    // Load user's main row to determine class and existing SPs
+    let pool = pool_from_ctx(ctx).await?;
+    let user_id = from_user_id(it.user.id);
+    let Some(main) = repo::get_user_main_row(&pool, raid_id, user_id).await? else {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("You need a MAIN row to add extra SPs.").ephemeral(true)
+        )).await?;
+        return Ok(());
+    };
+    let class = main.joined_as.split('/').next().map(|s| s.trim().to_string()).unwrap_or_default();
+    let active_sp = main.joined_as.split('/').nth(1).map(|s| s.trim().to_ascii_uppercase());
+    let mut sp_list: Vec<i32> = if class.eq_ignore_ascii_case("MSW") { vec![1,2,3,4,9,10,11] } else { (1..=11).collect() };
+    // Filter out already present SPs
+    let existing: std::collections::HashSet<String> = main.extra_sps.iter().map(|s| s.trim().to_ascii_uppercase()).chain(active_sp.clone().into_iter()).collect();
+    sp_list.retain(|i| !existing.contains(&format!("SP{}", i)));
+    if sp_list.is_empty() {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("No additional SPs available for your class.").ephemeral(true)
+        )).await?;
+        return Ok(());
+    }
+    // Build select
+    let options: Vec<CreateSelectMenuOption> = sp_list.into_iter().map(|i| {
+        let label = format!("SP{}", i);
+        CreateSelectMenuOption::new(&label, &label)
+    }).collect();
+    let menu = CreateSelectMenu::new(
+        format!("r:aspick:{raid_id}"),
+        CreateSelectMenuKind::String { options }
+    ).placeholder("Pick SP to add").min_values(1).max_values(1);
+
+    it.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new()
+            .content(format!("Add SP for class {}:", class))
+            .ephemeral(true)
+            .components(vec![CreateActionRow::SelectMenu(menu)])
+    )).await?;
+    Ok(())
+}
+
+async fn add_sp_pick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
+    let ComponentInteractionDataKind::StringSelect { values } = &it.data.kind else { return Ok(()); };
+    let Some(sp) = values.first() else { return Ok(()); };
+    let user_id = from_user_id(it.user.id);
+
+    // Publish to queue for DB write
+    let pool = pool_from_ctx(ctx).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    let redis = redis_from_ctx(ctx).await?;
+    let ev = queue::RaidEvent::AddSp { raid_id, guild_id: raid.guild_id, user_id, sp: sp.clone() };
+    let corr = queue::publish(&redis, &ev).await?;
+    let _ack = queue::wait_for_ack(&redis, &corr, 900).await?;
+
+    // Refresh embed
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    let parts = repo::list_participants(&pool, raid_id).await?;
+    let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
+    ChannelId::new(raid.channel_id as u64)
+        .edit_message(&ctx.http, raid.message_id as u64,
+                      EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id), menus::sp_buttons_row(raid_id)])).await?;
+    // ephemeral confirm
+    it.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content(format!("Added {}.", sp)).ephemeral(true)
+    )).await?;
+    // force + backup refresh consolidated list
+    let _ = crate::commands::raid::force_refresh_guild_raid_list(ctx, raid.guild_id as u64).await;
+    crate::commands::raid::trigger_refresh(ctx, raid.guild_id as u64).await;
+    Ok(())
+}
+
+async fn change_sp_start(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
+    let pool = pool_from_ctx(ctx).await?;
+    let user_id = from_user_id(it.user.id);
+    let Some(main) = repo::get_user_main_row(&pool, raid_id, user_id).await? else {
+        it.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content("You need a MAIN row to change SP.").ephemeral(true)
+        )).await?;
+        return Ok(());
+    };
+    let active_sp = main.joined_as.split('/').nth(1).map(|s| s.trim().to_string()).unwrap_or_else(|| "SP1".to_string());
+    let mut items: Vec<String> = vec![active_sp.clone()];
+    for s in main.extra_sps.iter() {
+        if !items.iter().any(|x| x.eq_ignore_ascii_case(s)) { items.push(s.clone()); }
+    }
+    let options: Vec<CreateSelectMenuOption> = items.into_iter().map(|label| {
+        let mut opt = CreateSelectMenuOption::new(&label, &label);
+        if label.eq_ignore_ascii_case(&active_sp) { opt = opt.default_selection(true); }
+        opt
+    }).collect();
+
+    let menu = CreateSelectMenu::new(
+        format!("r:cspick:{raid_id}"),
+        CreateSelectMenuKind::String { options }
+    ).placeholder("Select active SP").min_values(1).max_values(1);
+
+    it.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new()
+            .content("Change your active SP:")
+            .ephemeral(true)
+            .components(vec![CreateActionRow::SelectMenu(menu)])
+    )).await?;
+    Ok(())
+}
+
+async fn change_sp_pick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
+    let ComponentInteractionDataKind::StringSelect { values } = &it.data.kind else { return Ok(()); };
+    let Some(sp) = values.first() else { return Ok(()); };
+
+    let pool = pool_from_ctx(ctx).await?;
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    let user_id = from_user_id(it.user.id);
+
+    // Publish to queue for DB write
+    let redis = redis_from_ctx(ctx).await?;
+    let ev = queue::RaidEvent::ChangeSp { raid_id, guild_id: raid.guild_id, user_id, sp: sp.clone() };
+    let corr = queue::publish(&redis, &ev).await?;
+    let _ack = queue::wait_for_ack(&redis, &corr, 900).await?;
+
+    // Refresh embed
+    let raid = repo::get_raid(&pool, raid_id).await?;
+    let parts = repo::list_participants(&pool, raid_id).await?;
+    let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
+    ChannelId::new(raid.channel_id as u64)
+        .edit_message(&ctx.http, raid.message_id as u64,
+                      EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id), menus::sp_buttons_row(raid_id)])).await?;
+    it.create_response(&ctx.http, CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new().content(format!("Active SP set to {}.", sp)).ephemeral(true)
+    )).await?;
+    let _ = crate::commands::raid::force_refresh_guild_raid_list(ctx, raid.guild_id as u64).await;
+    crate::commands::raid::trigger_refresh(ctx, raid.guild_id as u64).await;
     Ok(())
 }
 
@@ -302,7 +447,7 @@ async fn confirm_join(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         .edit_message(&ctx.http, raid.message_id as u64,
                       EditMessage::new()
                           .embed(embed)
-                          .components(vec![menus::main_buttons_row(raid_id)])
+                          .components(vec![menus::main_buttons_row(raid_id), menus::sp_buttons_row(raid_id)])
         ).await?;
 
     // Finalny komunikat do użytkownika – edycja tej samej odpowiedzi
@@ -400,7 +545,7 @@ async fn refresh_message(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid
     let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &participants);
     ChannelId::new(raid.channel_id as u64)
         .edit_message(&ctx.http, raid.message_id as u64,
-                      EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)]))
+                      EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id), menus::sp_buttons_row(raid_id)]))
         .await?;
         it.create_response(&ctx.http, CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new().content(tip).ephemeral(true)
@@ -450,8 +595,8 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
     }
 
 
-    // reserves-only options for Promote
-    let mut promote_opts: Vec<(String, String)> = parts
+    // reserves-only options for Promote (all, will paginate later)
+    let mut promote_all: Vec<(String, String)> = parts
         .iter()
         .filter(|p| !p.is_main)
         .map(|p| {
@@ -465,7 +610,7 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         })
         .collect();
 
-    let mut promote_to_reserve_opts: Vec<(String, String)> = parts
+    let mut move_to_reserve_all: Vec<(String, String)> = parts
         .iter()
         .filter(|p| p.is_main)
         .map(|p| {
@@ -479,7 +624,7 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         })
         .collect();
 
-    let mut kick_opts: Vec<(String, String)> = parts
+    let mut kick_all: Vec<(String, String)> = parts
         .iter()
         .map(|p| {
             let name = name_map.get(&p.user_id)
@@ -498,45 +643,72 @@ async fn owner_manage(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -
         })
         .collect();
 
-    if kick_opts.is_empty() {
-        kick_opts.push(("No participants".into(), "none".into()));
-    }
+    // Pagination
+    let total = kick_all.len().max(move_to_reserve_all.len()).max(promote_all.len()).max(1);
+    let pages = (total + MGMT_PAGE_SIZE - 1) / MGMT_PAGE_SIZE;
+    let key = (it.user.id.get(), raid_id);
+    let page = OWNER_MGMT_PAGE.get(&key).map(|v| *v.value()).unwrap_or(0).min(pages.saturating_sub(1));
+    OWNER_MGMT_PAGE.insert(key, page);
+    let start = page * MGMT_PAGE_SIZE;
+    let end = ((page + 1) * MGMT_PAGE_SIZE).min(total);
 
-    if promote_to_reserve_opts.is_empty() {
-        promote_to_reserve_opts.push(("No reserves".into(), "none".into()));
-    }
+    let slice = |v: &Vec<(String, String)>| -> Vec<(String, String)> {
+        if v.is_empty() {
+            return vec![("No items".into(), "none".into())];
+        }
+        let s = start.min(v.len());
+        let e = end.min(v.len());
+        let mut out = v[s..e].to_vec();
+        if out.is_empty() {
+            out.push(("No items on this page".into(), "none".into()));
+        }
+        out
+    };
 
+    let promote_opts = slice(&promote_all);
+    let move_to_reserve_opts = slice(&move_to_reserve_all);
+    let kick_opts = slice(&kick_all);
 
-    if promote_opts.is_empty() {
-        promote_opts.push(("No reserves".into(), "none".into()));
-    }
-
-    // Any participants for Kick
-
+    let page_label = format!("Page {}/{}", page + 1, pages.max(1));
 
     it.edit_response(&ctx.http, EditInteractionResponse::new()
         .content("Owner controls")
         .components(vec![
-            menus::user_select_row(format!("r:pr:{raid_id}"), "Promote reserve → main", promote_opts),
-            menus::user_select_row(format!("r:mr:{raid_id}"), "Promote main → reserve ", promote_to_reserve_opts),
-            menus::user_select_row(format!("r:kk:{raid_id}"), "Kick user ", kick_opts),
+            menus::user_select_row(format!("r:pr:{raid_id}"), &format!("Promote reserve → main · {}", page_label), promote_opts),
+            menus::user_select_row(format!("r:mr:{raid_id}"), &format!("Promote main → reserve · {}", page_label), move_to_reserve_opts),
+            menus::user_select_row(format!("r:kk:{raid_id}"), &format!("Kick user · {}", page_label), kick_opts),
             CreateActionRow::Buttons(vec![
-                CreateButton::new(format!("r:cx:{raid_id}"))
-                    .label("Cancel Raid (DM all + delete in 1h)")
-                    .style(ButtonStyle::Danger),
-                CreateButton::new(format!("r:cl:{raid_id}"))
-                    .label("Close")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new(format!("r:not:{raid_id}"))
-                    .label("Notify All Participants ")
-                    .style(ButtonStyle::Secondary),
+                CreateButton::new(format!("r:mgp:prev:{raid_id}"))
+                    .label("◀ Prev")
+                    .style(ButtonStyle::Secondary)
+                    .disabled(page == 0),
+                CreateButton::new(format!("r:mgp:next:{raid_id}"))
+                    .label("Next ▶")
+                    .style(ButtonStyle::Secondary)
+                    .disabled(page + 1 >= pages),
                 CreateButton::new(format!("r:cho:{raid_id}"))
                     .label("Change Owner")
                     .style(ButtonStyle::Primary),
+                CreateButton::new(format!("r:not:{raid_id}"))
+                    .label("Notify All Participants ")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new(format!("r:cl:{raid_id}"))
+                    .label("Close")
+                    .style(ButtonStyle::Secondary),
             ])
         ])
     ).await?;
     Ok(())
+}
+
+async fn owner_manage_page(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid, delta: i32) -> anyhow::Result<()> {
+    // Adjust page and re-render manage view
+    let key = (it.user.id.get(), raid_id);
+    let cur = OWNER_MGMT_PAGE.get(&key).map(|v| *v.value()).unwrap_or(0) as i32;
+    let newp = (cur + delta).max(0) as usize;
+    OWNER_MGMT_PAGE.insert(key, newp);
+    // Reuse owner_manage to render (it recomputes page bounds and renders)
+    owner_manage(ctx, it, raid_id).await
 }
 
 async fn owner_promote(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> anyhow::Result<()> {
@@ -592,7 +764,7 @@ async fn owner_promote(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) 
         let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
         ChannelId::new(raid.channel_id as u64)
             .edit_message(&ctx.http, raid.message_id as u64,
-                          EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)])).await?;
+                          EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id), menus::sp_buttons_row(raid_id)])).await?;
 
         it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new().content("Promoted.")
@@ -645,7 +817,7 @@ async fn owner_move_to_reserve(ctx: &Context, it: &ComponentInteraction, raid_id
         let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
         ChannelId::new(raid.channel_id as u64)
             .edit_message(&ctx.http, raid.message_id as u64,
-                          EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)])).await?;
+                          EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id), menus::sp_buttons_row(raid_id)])).await?;
 
         it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new().content("Moved to reserve.")
@@ -691,7 +863,7 @@ async fn owner_kick(ctx: &Context, it: &ComponentInteraction, raid_id: Uuid) -> 
         let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
         ChannelId::new(raid.channel_id as u64)
             .edit_message(&ctx.http, raid.message_id as u64,
-                          EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)])).await?;
+                          EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id), menus::sp_buttons_row(raid_id)])).await?;
         // refresh consolidated list if any
         let _ = crate::commands::raid::refresh_guild_raid_list_if_any(ctx, raid.guild_id as u64).await;
         it.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(
@@ -1005,7 +1177,7 @@ async fn owner_change_confirm(ctx: &Context, it: &ComponentInteraction, raid_id:
     let embed = embeds::render_raid_embed(ctx, raid.guild_id as u64, &raid, &parts);
     ChannelId::new(raid.channel_id as u64)
         .edit_message(&ctx.http, raid.message_id as u64,
-                      EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id)]))
+                      EditMessage::new().embed(embed).components(vec![menus::main_buttons_row(raid_id), menus::sp_buttons_row(raid_id)]))
         .await?;
 
     OWNER_CHANGE.remove(&key);
