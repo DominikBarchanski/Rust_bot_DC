@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::db::repo;
 use crate::handlers::pool_from_ctx;
 use crate::ui::{embeds, menus};
-use crate::utils::{parse_raid_datetime, weekday_key,parse_list_unique, mention_user, ORGANISER_ROLE_NAME};
+use crate::utils::{parse_raid_datetime, weekday_key,parse_list_unique, mention_user, ORGANISER_ROLE_NAME, PERMISSIONS_ROLE_NAME};
 use crate::tasks;
 use crate::utils::extract_duration_hours;
 use chrono_tz::Europe::Warsaw;
@@ -43,6 +43,7 @@ pub async fn register(ctx: &Context) -> anyhow::Result<()> {
                     .add_string_choice("Hc_Alzanor", "Hc_Alzanor")
                     .add_string_choice("Hc_A8-A6", "Hc_A8-A6")
                     .add_string_choice("Hc_A1-A5", "Hc_A1-A5")
+                    .add_string_choice("Hc_A1-8", "Hc_A1-8")
                     .add_string_choice("Nezarun", "Nezarun")
                     .add_string_choice("Nezarun_v2", "Nezarun_v2")
             )
@@ -74,7 +75,7 @@ fn emoji_and_slug(raid_choice: &str) -> (&'static str, String) {
         "valehir" => "💀",
         "alzanor" => "🥶",
         "sky-tower" => "🗼",
-        "nezarun" => "⚜️",
+        "nezarun" => "🔨",
         "nezarun-v2" => "🐙",
         s if s.starts_with("hc-") => "🔥", // Hc_* variants
         _ => "🏷️", // fallback
@@ -140,6 +141,16 @@ pub async fn register_all_raid_list(ctx: &Context) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Register command to move the consolidated raids list to the current channel
+pub async fn register_move_raid_list(ctx: &Context) -> anyhow::Result<()> {
+    Command::create_global_command(
+        &ctx.http,
+        CreateCommand::new("move_raid_list_here")
+            .description("Move the guild's consolidated raids list to this channel (raid_organiser only)")
+    ).await?;
+    Ok(())
+}
+
 pub async fn handle(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
     match cmd.data.name.as_str() {
         "raid" => handle_create(ctx, cmd).await,
@@ -147,6 +158,7 @@ pub async fn handle(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<(
         "raid_transfer" => handle_transfer(ctx, cmd).await,
         "role_add" => handle_role_add(ctx, cmd).await,
         "all_raid_list" => handle_all_raid_list(ctx, cmd).await,
+        "move_raid_list_here" => handle_move_raid_list(ctx, cmd).await,
         _ => Ok(())
     }
 }
@@ -550,7 +562,7 @@ async fn handle_all_raid_list(ctx: &Context, cmd: &CommandInteraction) -> anyhow
                 .edit_response(
                     &ctx.http,
                     EditInteractionResponse::new().content(format!(
-                        "❌ Lista dla tego serwera już istnieje w kanale <#{}>. Aby przenieść, najpierw usuń istniejącą lub użyj dedykowanej komendy przeniesienia.",
+                        "❌ Lista dla tego serwera już istnieje w kanale <#{}>. Aby przenieść, użyj komendy: /move_raid_list_here w docelowym kanale.",
                         other_chan
                     )),
                 )
@@ -591,6 +603,94 @@ async fn handle_all_raid_list(ctx: &Context, cmd: &CommandInteraction) -> anyhow
                 .content("Posted/updated the raids list in this channel."),
         )
         .await;
+
+    Ok(())
+}
+
+async fn handle_move_raid_list(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Result<()> {
+    let Some(gid) = cmd.guild_id else { return Ok(()); };
+
+    // Quick ephemeral ACK
+    let _ = cmd
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⏳ Moving the raids list here…")
+                    .ephemeral(true),
+            ),
+        )
+        .await;
+
+    // Permission: must have raid_organiser role
+    let roles_map = gid.roles(&ctx.http).await?;
+    let invoker = gid.member(&ctx.http, cmd.user.id).await?;
+    let is_organiser = invoker.roles.iter().any(|rid| {
+        roles_map
+            .get(rid)
+            .map_or(false, |r| r.name.eq_ignore_ascii_case(PERMISSIONS_ROLE_NAME))
+    });
+    if !is_organiser {
+        cmd
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new()
+                    .content("Only raid_organiser can use this."),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let pool = crate::handlers::pool_from_ctx(ctx).await?;
+    let redis = crate::handlers::redis_from_ctx(ctx).await?;
+
+    // Render current list
+    let chunks = render_all_raids_list(ctx, &pool, gid.get()).await?;
+
+    // Find existing mapping
+    let existing = match crate::redis_ext::get_guild_list(&redis, gid.get()).await? {
+        Some(m) => Some(m),
+        None => match crate::db::repo::get_guild_raid_list(&pool, gid.get() as i64).await? {
+            Some(r) => {
+                let ids_u64: Vec<u64> = r.message_ids.iter().map(|i| *i as u64).collect();
+                Some((r.channel_id as u64, ids_u64))
+            }
+            None => None,
+        },
+    };
+
+    // Post in the target channel (current interaction channel)
+    let mut new_ids: Vec<u64> = Vec::new();
+    for c in &chunks {
+        let m = cmd
+            .channel_id
+            .send_message(&ctx.http, CreateMessage::new().content(c.clone()))
+            .await?;
+        new_ids.push(m.id.get());
+    }
+
+    // Persist new mapping
+    crate::redis_ext::set_guild_list(&redis, gid.get(), cmd.channel_id.get(), &new_ids).await?;
+    let ids_i64: Vec<i64> = new_ids.iter().map(|i| *i as i64).collect();
+    crate::db::repo::upsert_guild_raid_list(&pool, gid.get() as i64, cmd.channel_id.get() as i64, &ids_i64).await?;
+
+    // Try removing the old messages if mapping existed elsewhere
+    if let Some((old_chan, old_ids)) = existing {
+        if old_chan != cmd.channel_id.get() {
+            let old_channel = ChannelId::new(old_chan);
+            for mid in old_ids {
+                let _ = old_channel.delete_message(&ctx.http, mid).await;
+            }
+        }
+    }
+
+    // Finalize
+    cmd
+        .edit_response(
+            &ctx.http,
+            EditInteractionResponse::new().content("Przeniesiono listę rajdów do tego kanału."),
+        )
+        .await?;
 
     Ok(())
 }

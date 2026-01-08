@@ -49,7 +49,7 @@ BEGIN
     WHERE conname = 'raids_raid_name_check'
   ) THEN
     ALTER TABLE raids
-      ADD CONSTRAINT raids_raid_name_check CHECK (raid_name IN ('ArmaV2','Pollutus','Arma','Azgobas','Valehir','Alzanor','Hc_Azgobas','Hc_Valehir','Hc_Alzanor','Hc_A8-A6','Hc_A1-A5','Sky-Tower','Sky_Tower', 'Nezarun','Nezarun_v2'));
+      ADD CONSTRAINT raids_raid_name_check CHECK (raid_name IN ('ArmaV2','Pollutus','Arma','Azgobas','Valehir','Alzanor','Hc_Azgobas','Hc_Valehir','Hc_Alzanor','Hc_A8-A6','Hc_A1-A5','Hc_A1-A8','Sky-Tower','Sky_Tower', 'Nezarun','Nezarun_v2'));
   END IF;
 END $$;
 

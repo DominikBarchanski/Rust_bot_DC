@@ -12,6 +12,7 @@ use regex::Regex;
 use std::collections::HashMap;
 
 pub const ORGANISER_ROLE_NAME: &str = "raid_organiser";
+pub const PERMISSIONS_ROLE_NAME: &str = "Zarządca_permisje";
 static NAME_CACHE: Lazy<DashMap<u64, (String, Instant)>> = Lazy::new(DashMap::new);
 const NAME_TTL: StdDuration = StdDuration::from_secs(60 * 30); // 30 min
 

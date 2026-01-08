@@ -114,6 +114,11 @@ pub fn schedule_raid_15m_reminder(
         let raid = match crate::db::repo::get_raid(&pool, raid_id).await {
             Ok(r) => r, Err(_) => return,
         };
+
+        // If the raid was cancelled in the meantime, do not send DMs
+        if !raid.is_active {
+            return;
+        }
         let parts = match crate::db::repo::list_participants(&pool, raid_id).await {
             Ok(v) => v, Err(_) => return,
         };

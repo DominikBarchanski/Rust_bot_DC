@@ -8,5 +8,6 @@ pub async fn register_commands(ctx: &Context) -> anyhow::Result<()> {
     raid::register_transfer(ctx).await?;
     raid::register_role_add(ctx).await?;
     raid::register_all_raid_list(ctx).await?;
+    raid::register_move_raid_list(ctx).await?;
     Ok(())
 }
