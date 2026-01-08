@@ -46,6 +46,7 @@ pub async fn register(ctx: &Context) -> anyhow::Result<()> {
                     .add_string_choice("Hc_A1-8", "Hc_A1-8")
                     .add_string_choice("Nezarun", "Nezarun")
                     .add_string_choice("Nezarun_v2", "Nezarun_v2")
+                    .add_string_choice("Fernon", "Fernon")
             )
             .add_option(CreateCommandOption::new(CommandOptionType::String, "raid_date", "Format: HH:MM YYYY-MM-DD").required(true))
             .add_option(CreateCommandOption::new(CommandOptionType::Integer, "max_players", "Main slots").required(true))
