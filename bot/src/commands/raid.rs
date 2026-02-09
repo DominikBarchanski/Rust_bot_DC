@@ -365,6 +365,7 @@ async fn handle_create(ctx: &Context, cmd: &CommandInteraction) -> anyhow::Resul
     tasks::schedule_raid_15m_reminder(
         ctx.http.clone(),
         pool_from_ctx(ctx).await?,
+        crate::handlers::redis_from_ctx(ctx).await?,
         raid_id,
         scheduled_for - chrono::Duration::minutes(15),
     );

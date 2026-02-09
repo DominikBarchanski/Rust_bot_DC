@@ -33,8 +33,9 @@ impl EventHandler for Handler {
         // Restore all scheduled jobs after restart (non-blocking)
         let http = ctx.http.clone();
         let pool = self.pool.clone();
+        let redis = self.redis.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::tasks::restore_schedules(http, pool).await {
+            if let Err(e) = crate::tasks::restore_schedules(http, pool, redis).await {
                 eprintln!("restore_schedules failed: {e:#}");
             }
         });

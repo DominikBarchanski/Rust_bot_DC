@@ -101,6 +101,7 @@ async fn promote_and_refresh(
 pub fn schedule_raid_15m_reminder(
     http: Arc<Http>,
     pool: PgPool,
+    redis: redis::Client,
     raid_id: uuid::Uuid,
     scheduled_for_utc: chrono::DateTime<chrono::Utc>,
 ) {
@@ -119,6 +120,18 @@ pub fn schedule_raid_15m_reminder(
         if !raid.is_active {
             return;
         }
+
+        let claimed = match crate::redis_ext::claim_raid_reminder_15m(&redis, raid_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("claim_raid_reminder_15m failed: {e:#}");
+                true
+            }
+        };
+        if !claimed {
+            return;
+        }
+
         let parts = match crate::db::repo::list_participants(&pool, raid_id).await {
             Ok(v) => v, Err(_) => return,
         };
@@ -149,6 +162,7 @@ pub fn schedule_raid_15m_reminder(
 pub async fn restore_schedules(
     http: Arc<Http>,
     pool: PgPool,
+    redis: redis::Client,
 ) -> anyhow::Result<()> {
     // Fetch all active raids we might need to handle
     let raids = repo::list_active_raids_for_restore(&pool).await?;
@@ -169,10 +183,10 @@ pub async fn restore_schedules(
         // 3b) 15-minute reminder
         let reminder_at = r.scheduled_for - CDuration::minutes(15);
         if chrono::Utc::now() < reminder_at {
-            schedule_raid_15m_reminder(http.clone(), pool.clone(), r.id, reminder_at);
+            schedule_raid_15m_reminder(http.clone(), pool.clone(), redis.clone(), r.id, reminder_at);
         } else if chrono::Utc::now() < r.scheduled_for {
             // missed but raid not started yet → send immediately
-            schedule_raid_15m_reminder(http.clone(), pool.clone(), r.id, chrono::Utc::now());
+            schedule_raid_15m_reminder(http.clone(), pool.clone(), redis.clone(), r.id, chrono::Utc::now());
         }
 
         // 3c) Auto-delete (recompute from description like at creation)
